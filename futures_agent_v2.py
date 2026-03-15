@@ -484,8 +484,5 @@ if __name__ == "__main__":
         for k in missing: print(f"   export {m[k]}='твой_ключ'")
         print("   или создай файл .env рядом со скриптом")
         sys.exit(1)
-    if not CONFIG["testnet"]:
-        if input("\n⚠️  РЕАЛЬНЫЕ ДЕНЬГИ! Введи ДА: ").strip().upper() not in ("ДА","DA","YES","Y"):
-            sys.exit(0)
     print(f"\n🤖 Агент запущен [{'TESTNET' if CONFIG['testnet'] else 'REAL'}] | Ctrl+C для остановки\n")
     asyncio.run(Agent(CONFIG).run())
