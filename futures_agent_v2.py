@@ -14,6 +14,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import ta
@@ -49,6 +51,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv_file(os.path.join(BASE_DIR, ".env"))
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 CONFIG = {
     "testnet":        True,
     "api_key":        os.getenv("BYBIT_API_KEY", ""),
@@ -68,6 +80,11 @@ CONFIG = {
     "close_hour_utc": 23,
     "close_min_utc":  45,
     "cycle_sec":      900,
+    "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "tg_min_interval_sec": env_int("TG_MIN_INTERVAL_SEC", 3),
+    "tg_error_cooldown_sec": env_int("TG_ERROR_COOLDOWN_SEC", 180),
+    "tg_timeout_sec": env_int("TG_TIMEOUT_SEC", 10),
 }
 
 
@@ -87,9 +104,56 @@ class Trade:
 class DayStats:
     date: str = ""
     trades: list = field(default_factory=list)
+    signals_total: int = 0
+    opened: int = 0
     skipped: int = 0
     consecutive_losses: int = 0
     stopped: bool = False
+
+
+class TelegramNotifier:
+    def __init__(self, cfg, log):
+        self.log = log
+        self.token = str(cfg.get("telegram_bot_token", "")).strip()
+        self.chat_id = str(cfg.get("telegram_chat_id", "")).strip()
+        self.enabled = bool(self.token and self.chat_id)
+        self.min_interval_sec = max(int(cfg.get("tg_min_interval_sec", 3)), 0)
+        self.error_cooldown_sec = max(int(cfg.get("tg_error_cooldown_sec", 180)), 1)
+        self.timeout_sec = max(int(cfg.get("tg_timeout_sec", 10)), 1)
+        self.last_sent_ts = 0.0
+        self.last_error_ts = {}
+
+    def send(self, text: str, force: bool = False) -> bool:
+        if not self.enabled:
+            return False
+        body = (text or "").strip()
+        if not body:
+            return False
+        now = time.time()
+        if not force and (now - self.last_sent_ts) < self.min_interval_sec:
+            return False
+        payload = urlencode({"chat_id": self.chat_id, "text": body[:4096]}).encode("utf-8")
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        req = Request(url=url, data=payload, method="POST",
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urlopen(req, timeout=self.timeout_sec) as r:
+                r.read()
+            self.last_sent_ts = now
+            return True
+        except Exception as ex:
+            self.log.error(f"Telegram send failed: {ex}")
+            return False
+
+    def send_error(self, key: str, text: str) -> bool:
+        if not self.enabled:
+            return False
+        now = time.time()
+        last = self.last_error_ts.get(key, 0.0)
+        if (now - last) < self.error_cooldown_sec:
+            return False
+        self.last_error_ts[key] = now
+        return self.send(f"[ERROR] {text}", force=True)
 
 
 class BybitClient:
@@ -316,11 +380,12 @@ def screen_coins(ex, cfg):
     return [s for s,_ in result[:20]]
 
 
-def make_report(stats, llm):
+def make_report(stats, llm, max_trades_per_day):
     wins   = [t for t in stats.trades if (t.pnl_usd or 0)>0]
     losses = [t for t in stats.trades if (t.pnl_usd or 0)<0]
     pnl    = sum((t.pnl_usd or 0) for t in stats.trades)
     wr     = len(wins)/len(stats.trades)*100 if stats.trades else 0
+    closed = len(stats.trades)
     lines  = []
     for i,t in enumerate(stats.trades,1):
         icon = "WIN" if (t.pnl_usd or 0)>0 else ("LOSS" if (t.pnl_usd or 0)<0 else "BE")
@@ -328,9 +393,10 @@ def make_report(stats, llm):
                      f"PnL:{(t.pnl_usd or 0):+.4f}$ conf:{t.confidence}% {t.close_reason}")
     report = (
         f"\n{'='*52}\n  ОТЧЁТ {stats.date}\n{'='*52}\n"
-        f"  Сделок:{len(stats.trades)}/5 WIN:{len(wins)} LOSS:{len(losses)}\n"
+        f"  Сделок:{closed}/{max_trades_per_day} WIN:{len(wins)} LOSS:{len(losses)}\n"
         f"  Винрейт:{wr:.1f}% | PnL:{pnl:+.4f}$\n"
-        f"  Пропущено:{stats.skipped}\n{'─'*52}\n"
+        f"  Сигналов:{stats.signals_total} | Скип:{stats.skipped} | Открыто:{stats.opened} | Закрыто:{closed}\n"
+        f"{'─'*52}\n"
         + ("\n".join(lines) if lines else "  Сделок не было")
         + f"\n{'─'*52}\n  {llm.summary(stats)}\n{'='*52}\n"
     )
@@ -355,13 +421,33 @@ class Agent:
             handlers=[logging.StreamHandler(),
                       logging.FileHandler(log_path, encoding="utf-8")])
         self.log = logging.getLogger("agent")
+        self.tg = TelegramNotifier(cfg, self.log)
+
+    def day_summary_text(self, title, open_positions):
+        wins = [t for t in self.stats.trades if (t.pnl_usd or 0) > 0]
+        losses = [t for t in self.stats.trades if (t.pnl_usd or 0) < 0]
+        pnl = sum((t.pnl_usd or 0) for t in self.stats.trades)
+        wr = len(wins) / len(self.stats.trades) * 100 if self.stats.trades else 0
+        return (
+            f"{title}\n"
+            f"Дата: {self.stats.date}\n"
+            f"Сигналов: {self.stats.signals_total}\n"
+            f"Скип: {self.stats.skipped}\n"
+            f"Открыто: {self.stats.opened}\n"
+            f"Закрыто: {len(self.stats.trades)}\n"
+            f"Открытые позиции: {open_positions}\n"
+            f"WIN: {len(wins)} LOSS: {len(losses)} WR: {wr:.1f}%\n"
+            f"Итог PnL: {pnl:+.4f}$"
+        )
 
     def day_reset(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.stats.date:
+            open_before_close = len(self.open_trades)
             self.close_all("новый день")
-            report, path = make_report(self.stats, self.llm)
+            report, path = make_report(self.stats, self.llm, self.cfg["max_trades_per_day"])
             print(report); self.log.info(f"Отчёт: {path}")
+            self.tg.send(self.day_summary_text("Суточный отчёт агента", open_before_close), force=True)
             self.stats = DayStats(date=today)
 
     def close_all(self, reason):
@@ -377,9 +463,16 @@ class Agent:
                     t.close_reason=reason; t.pnl_usd=round(pnl,4)
                     self.stats.trades.append(t)
                     self.log.info(f"Закрыта {sym}: {pnl:+.4f}$ ({reason})")
+                    self.tg.send(
+                        f"Закрыта позиция {sym} {t.direction}\n"
+                        f"Причина: {reason}\n"
+                        f"PnL: {pnl:+.4f}$",
+                        force=True,
+                    )
                 del self.open_trades[sym]
             except Exception as ex:
                 self.log.error(f"close_all {sym}: {ex}")
+                self.tg.send_error("close_all", f"close_all {sym}: {ex}")
 
     def sync_trades(self):
         for sym, t in list(self.open_trades.items()):
@@ -390,9 +483,16 @@ class Agent:
                     self.stats.trades.append(t)
                     self.stats.consecutive_losses = self.stats.consecutive_losses+1 if (t.pnl_usd or 0)<0 else 0
                     self.log.info(f"SL/TP сработал: {sym}")
+                    self.tg.send(
+                        f"Позиция закрыта по SL/TP: {sym} {t.direction}\n"
+                        f"Strategy: {t.strategy}\n"
+                        f"Entry: {t.entry} | SL: {t.sl} | TP: {t.tp}",
+                        force=True,
+                    )
                     del self.open_trades[sym]
             except Exception as ex:
                 self.log.error(f"sync {sym}: {ex}")
+                self.tg.send_error("sync", f"sync {sym}: {ex}")
 
     async def cycle(self):
         now = datetime.now(timezone.utc)
@@ -423,8 +523,10 @@ class Agent:
                 time.sleep(0.15)
             except Exception as ex:
                 self.log.error(f"Анализ {sym}: {ex}")
+                self.tg.send_error("analysis", f"Анализ {sym}: {ex}")
 
         if not all_sigs: self.log.info("Сигналов нет"); return
+        self.stats.signals_total += len(all_sigs)
         self.log.info(f"Найдено {len(all_sigs)} сигналов → LLM")
         slots = self.cfg["max_trades_per_day"] - done
 
@@ -451,9 +553,17 @@ class Agent:
                         entry=e,sl=sl,tp=tp,size_usd=self.cfg["trade_size_usd"],
                         confidence=conf,open_time=datetime.now(timezone.utc).isoformat(),order_id=oid)
                 self.open_trades[sym]=t
+                self.stats.opened += 1
                 self.log.info(f"ОТКРЫТА: {dr} {sym} {lev}x conf={conf}%")
+                self.tg.send(
+                    f"Открыта позиция {sym} {dr}\n"
+                    f"Strategy: {t.strategy} | Conf: {conf}% | Lev: {lev}x\n"
+                    f"Entry: {e} | SL: {sl} | TP: {tp}",
+                    force=True,
+                )
             except Exception as ex:
                 self.log.error(f"Открытие {sym}: {ex}")
+                self.tg.send_error("open_trade", f"Открытие {sym}: {ex}")
 
     async def run(self):
         mode = "TESTNET" if self.cfg["testnet"] else "*** REAL MONEY ***"
@@ -461,16 +571,26 @@ class Agent:
         self.log.info(f"FUTURES AGENT START | {mode}")
         self.log.info(f"Model:{self.cfg['llm_model']} | ${self.cfg['trade_size_usd']} R:R=1:{self.cfg['risk_reward']} | max:{self.cfg['max_trades_per_day']}/day")
         self.log.info("="*52)
+        self.tg.send(
+            f"Агент запущен\n"
+            f"Режим: {mode}\n"
+            f"Модель: {self.cfg['llm_model']}\n"
+            f"Лимит/день: {self.cfg['max_trades_per_day']} | Размер: ${self.cfg['trade_size_usd']}",
+            force=True
+        )
         while True:
             try:
                 self.day_reset()
                 await self.cycle()
             except KeyboardInterrupt:
+                open_before_close = len(self.open_trades)
                 self.close_all("остановка")
-                report, _ = make_report(self.stats, self.llm)
+                report, _ = make_report(self.stats, self.llm, self.cfg["max_trades_per_day"])
+                self.tg.send(self.day_summary_text("Агент остановлен. Итог дня", open_before_close), force=True)
                 print(report); break
             except Exception as ex:
                 self.log.error(f"Цикл: {ex}")
+                self.tg.send_error("cycle", f"Цикл: {ex}")
             self.log.info(f"Следующий цикл через {self.cfg['cycle_sec']}с")
             await asyncio.sleep(self.cfg["cycle_sec"])
 
