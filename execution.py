@@ -326,7 +326,12 @@ class Agent:
 
     async def cycle(self):
         now = datetime.now(timezone.utc)
+        self.log.info(
+            f"cycle_start ts={now.isoformat()} open_positions={len(self.open_trades)} "
+            f"closed_today={len(self.stats.trades)} skipped_today={self.stats.skipped}"
+        )
         if now.hour == self.cfg["close_hour_utc"] and now.minute >= self.cfg["close_min_utc"]:
+            self.log.info("cycle_eod_close_triggered=true")
             self.close_all("eod_close")
             return
 
@@ -341,32 +346,65 @@ class Agent:
 
         done = len(self.stats.trades) + len(self.open_trades)
         if done >= self.cfg["max_trades_per_day"]:
+            self.log.info(f"daily_trade_limit_reached done={done} max={self.cfg['max_trades_per_day']}")
             return
 
         symbols = screen_coins(self.ex, self.cfg)
+        self.log.info(f"scan_universe count={len(symbols)} symbols={','.join(symbols)}")
         candidates = []
+        scan_stats = {
+            "in_open_trades": 0,
+            "cooldown": 0,
+            "low_atr": 0,
+            "funding_block": 0,
+            "oi_spike": 0,
+            "no_signals": 0,
+            "middle_range": 0,
+            "low_score": 0,
+            "candidates": 0,
+        }
 
         for sym in symbols:
+            self.log.info(f"scan_symbol_start symbol={sym}")
             if sym in self.open_trades:
+                scan_stats["in_open_trades"] += 1
+                self.log.info(f"scan_symbol_skip symbol={sym} reason=already_open")
                 continue
             if self._in_symbol_cooldown(sym):
                 self.stats.skipped += 1
+                scan_stats["cooldown"] += 1
+                self.log.info(f"scan_symbol_skip symbol={sym} reason=cooldown")
                 continue
             try:
                 df = self.ex.klines(sym, self.cfg["entry_tf"])
                 ind = calc_indicators(df)
                 if not ind.get("atr") or ind["atr"] / ind["price"] < self.cfg["min_atr_ratio"]:
+                    scan_stats["low_atr"] += 1
+                    self.log.info(
+                        f"scan_symbol_skip symbol={sym} reason=low_atr atr={ind.get('atr')} "
+                        f"price={ind.get('price')} min_atr_ratio={self.cfg['min_atr_ratio']}"
+                    )
                     continue
 
                 fmeta = self.ex.funding_meta(sym)
                 fr = fmeta["rate"]
                 if in_funding_block(fmeta.get("next_funding_ms", 0), self.cfg["funding_block_minutes"]):
                     self.stats.skipped += 1
+                    scan_stats["funding_block"] += 1
+                    self.log.info(
+                        f"scan_symbol_skip symbol={sym} reason=funding_block funding_rate={fr} "
+                        f"block_minutes={self.cfg['funding_block_minutes']}"
+                    )
                     continue
 
                 oi = self.ex.open_interest(sym)
                 if oi_spike_block(oi.get("change_pct", 0), self.cfg["oi_spike_block_pct"]):
                     self.stats.skipped += 1
+                    scan_stats["oi_spike"] += 1
+                    self.log.info(
+                        f"scan_symbol_skip symbol={sym} reason=oi_spike oi_change_pct={oi.get('change_pct', 0)} "
+                        f"threshold={self.cfg['oi_spike_block_pct']}"
+                    )
                     continue
 
                 ind1h = calc_indicators(self.ex.klines(sym, self.cfg["regime_tf_1"]))
@@ -374,10 +412,23 @@ class Agent:
 
                 sigs = detect_signals(ind, fr)
                 self.stats.signals_total += len(sigs)
+                if not sigs:
+                    scan_stats["no_signals"] += 1
+                    self.log.info(f"scan_symbol_signals symbol={sym} count=0")
+                    continue
+                self.log.info(
+                    f"scan_symbol_signals symbol={sym} count={len(sigs)} "
+                    f"strategies={','.join([s.get('strategy', '?') for s in sigs])}"
+                )
                 for s in sigs:
                     ok_mid, mid_reason = no_middle_range(s, ind, self.cfg["range_mid_avoid_pct"])
                     if not ok_mid:
                         self.stats.skipped += 1
+                        scan_stats["middle_range"] += 1
+                        self.log.info(
+                            f"scan_signal_skip symbol={sym} strategy={s.get('strategy')} direction={s.get('direction')} "
+                            f"reason={mid_reason}"
+                        )
                         continue
                     ok_regime, reg_reason = regime_filter(ind1h, ind4h, s["direction"])
                     score, reasons = score_signal(s, ind, fr, oi.get("change_pct", 0), ok_regime)
@@ -387,6 +438,11 @@ class Agent:
                         reasons.append(mid_reason)
                     if score < self.cfg["min_rule_score"]:
                         self.stats.skipped += 1
+                        scan_stats["low_score"] += 1
+                        self.log.info(
+                            f"scan_signal_skip symbol={sym} strategy={s.get('strategy')} direction={s.get('direction')} "
+                            f"reason=low_score score={score} min_rule_score={self.cfg['min_rule_score']}"
+                        )
                         continue
                     candidates.append(
                         {
@@ -399,29 +455,51 @@ class Agent:
                             "reasons": reasons,
                         }
                     )
+                    scan_stats["candidates"] += 1
+                    self.log.info(
+                        f"scan_signal_candidate symbol={sym} strategy={s.get('strategy')} direction={s.get('direction')} "
+                        f"score={score} reasons={','.join(reasons[:6])}"
+                    )
                 time.sleep(0.12)
             except Exception as ex:
                 self.log.error(f"analyze_failed symbol={sym} err={ex}")
                 self.tg.send_error("analysis", f"Анализ {sym}: {ex}")
 
+        self.log.info(
+            "scan_summary "
+            f"symbols={len(symbols)} in_open={scan_stats['in_open_trades']} cooldown={scan_stats['cooldown']} "
+            f"low_atr={scan_stats['low_atr']} funding_block={scan_stats['funding_block']} "
+            f"oi_spike={scan_stats['oi_spike']} no_signals={scan_stats['no_signals']} "
+            f"middle_range={scan_stats['middle_range']} low_score={scan_stats['low_score']} "
+            f"candidates={scan_stats['candidates']}"
+        )
         if not candidates:
+            self.log.info("cycle_result candidates=0 action=no_trade")
             return
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         candidates = self._candidate_llm_rank(candidates)
         slots = self.cfg["max_trades_per_day"] - done
+        top_preview = ",".join([f"{x['sym']}:{x['score']}" for x in candidates[:5]])
+        self.log.info(f"cycle_candidates total={len(candidates)} slots={slots} top={top_preview}")
 
         for item in candidates[: slots + 3]:
             if len(self.open_trades) + len(self.stats.trades) >= self.cfg["max_trades_per_day"]:
+                self.log.info("cycle_order_loop_stop reason=max_trades_reached")
                 break
 
             sym = item["sym"]
             if sym in self.open_trades:
+                self.log.info(f"cycle_order_loop_skip symbol={sym} reason=already_open")
                 continue
 
             try:
                 s = item["sig"]
                 direction = s["direction"]
+                self.log.info(
+                    f"cycle_order_try symbol={sym} strategy={s.get('strategy')} direction={direction} "
+                    f"score={item.get('score')}"
+                )
                 wallet = self.ex.wallet_snapshot()
                 limits = self.ex.instrument_constraints(sym)
                 sizing, reject_reason = size_position(
