@@ -80,6 +80,7 @@ def build_config() -> dict[str, Any]:
         "risk_per_trade_usd": env_float("RISK_PER_TRADE_USD", 0.0),
         "target_notional_usd": env_float("TARGET_NOTIONAL_USD", 5.0),
         "max_side_risk_pct": env_float("MAX_SIDE_RISK_PCT", 1.5),
+        "disable_side_risk_guard": env_bool("DISABLE_SIDE_RISK_GUARD", False),
         "slippage_entry_bps": env_float("SLIPPAGE_ENTRY_BPS", 10.0),
         "slippage_exit_bps": env_float("SLIPPAGE_EXIT_BPS", 15.0),
         "taker_fee_bps": env_float("TAKER_FEE_BPS", 5.5),

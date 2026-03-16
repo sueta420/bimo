@@ -1,51 +1,44 @@
 # Bybit Futures Agent (Refactored)
 
-## What is implemented now
-- Rule-based signal selection (LLM is not a gatekeeper)
-- Risk sizing: `wallet equity -> risk_per_trade -> stop distance -> qty`
-- Execution constraints: tick/qty step, min qty, min notional, max leverage, available balance guard
-- Cost reserves: taker fees + slippage + funding reserve
-- State machine with SQLite persistence:
+## English
+
+### Features
+- Rule-based signal selection (LLM is optional for explain/rank)
+- Position sizing with exchange constraints (`qtyStep`, `minOrderQty`, `minNotional`)
+- Risk and execution guards (side-risk, correlation, funding/OI filters, cooldowns)
+- SQLite state machine:
   `SIGNALLED -> ORDER_SENT -> FILLED -> OPEN -> PARTIALLY_CLOSED -> CLOSED -> RECONCILED`
-- Startup recovery/reconciliation from Bybit positions
-- Strategy filters:
-  - 1h/4h regime + 15m entries
-  - funding window block
-  - OI spike block
-  - no-entry in middle of range
-  - symbol cooldown after losing close
-  - max side risk exposure
-  - correlation guard for same-side positions
-  - break-even/trailing only after confirmed move
-- Telegram notifications
-- JSON structured logs
+- Telegram notifications and JSON logs
 
-## Project layout
-- `config.py`
-- `exchange.py`
-- `signals.py`
-- `risk.py`
-- `execution.py`
-- `portfolio.py`
-- `notifier.py`
-- `main.py`
-- `futures_agent_v2.py` (compat wrapper)
+### Position Sizing Modes
+- `POSITION_SIZING_MODE=risk_pct`
+  uses `RISK_PER_TRADE_PCT` (% of equity)
+- `POSITION_SIZING_MODE=risk_usd`
+  uses fixed `RISK_PER_TRADE_USD` risk per trade
+- `POSITION_SIZING_MODE=fixed_notional_usd`
+  uses fixed `TARGET_NOTIONAL_USD` position notional
 
-## Position sizing modes
-- `POSITION_SIZING_MODE=risk_pct`:
-  uses `RISK_PER_TRADE_PCT` from equity (default)
-- `POSITION_SIZING_MODE=risk_usd`:
-  uses fixed `RISK_PER_TRADE_USD` per trade
-- `POSITION_SIZING_MODE=fixed_notional_usd`:
-  uses fixed `TARGET_NOTIONAL_USD` position size
-
-Example:
+Examples:
 ```bash
+# Fixed risk per trade
+POSITION_SIZING_MODE=risk_usd
+RISK_PER_TRADE_USD=5.0
+
+# Fixed position size (notional)
 POSITION_SIZING_MODE=fixed_notional_usd
 TARGET_NOTIONAL_USD=5.0
 ```
 
-## Setup
+### Side-Risk Guard (Test Switch)
+- `DISABLE_SIDE_RISK_GUARD=false` (default): side-risk check is active (`MAX_SIDE_RISK_PCT`)
+- `DISABLE_SIDE_RISK_GUARD=true`: side-risk check is bypassed (for testing only)
+
+Example:
+```bash
+DISABLE_SIDE_RISK_GUARD=true
+```
+
+### Setup
 ```bash
 python3 -m pip install -r requirements.txt
 cp .env.example .env
@@ -53,24 +46,92 @@ cp .env.example .env
 python3 main.py
 ```
 
-Or keep old command:
+Compatibility command:
 ```bash
 python3 futures_agent_v2.py
 ```
 
-## Required env vars
+### Required Environment Variables
 - `BYBIT_API_KEY`
 - `BYBIT_API_SECRET`
 
-Optional but recommended:
+Optional:
 - `OPENAI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-## Tests
+### Tests
 ```bash
 pytest -q
 ```
 
-## Notes
-- In this environment, external network may be restricted; live Bybit integration should be validated on your side with real connectivity.
+### Notes
+- Live Bybit behavior should be validated in your runtime environment.
+
+## Русский
+
+### Что реализовано
+- Отбор сигналов по правилам (LLM опционален для объяснений/ранжирования)
+- Расчёт размера позиции с учётом ограничений биржи (`qtyStep`, `minOrderQty`, `minNotional`)
+- Риск- и execution-фильтры (side-risk, корреляции, funding/OI, cooldown)
+- Машина состояний в SQLite:
+  `SIGNALLED -> ORDER_SENT -> FILLED -> OPEN -> PARTIALLY_CLOSED -> CLOSED -> RECONCILED`
+- Уведомления в Telegram и JSON-логи
+
+### Режимы размера позиции
+- `POSITION_SIZING_MODE=risk_pct`
+  риск как `%` от equity (`RISK_PER_TRADE_PCT`)
+- `POSITION_SIZING_MODE=risk_usd`
+  фиксированный риск на сделку в USD (`RISK_PER_TRADE_USD`)
+- `POSITION_SIZING_MODE=fixed_notional_usd`
+  фиксированный объём входа в USD (`TARGET_NOTIONAL_USD`)
+
+Примеры:
+```bash
+# Фиксированный риск на сделку
+POSITION_SIZING_MODE=risk_usd
+RISK_PER_TRADE_USD=5.0
+
+# Фиксированный размер входа (номинал)
+POSITION_SIZING_MODE=fixed_notional_usd
+TARGET_NOTIONAL_USD=5.0
+```
+
+### Side-Risk Guard (переключатель для тестов)
+- `DISABLE_SIDE_RISK_GUARD=false` (по умолчанию): проверка side-risk включена (`MAX_SIDE_RISK_PCT`)
+- `DISABLE_SIDE_RISK_GUARD=true`: проверка side-risk отключается (только для тестов)
+
+Пример:
+```bash
+DISABLE_SIDE_RISK_GUARD=true
+```
+
+### Запуск
+```bash
+python3 -m pip install -r requirements.txt
+cp .env.example .env
+# заполните ключи в .env
+python3 main.py
+```
+
+Совместимый старый запуск:
+```bash
+python3 futures_agent_v2.py
+```
+
+### Обязательные переменные окружения
+- `BYBIT_API_KEY`
+- `BYBIT_API_SECRET`
+
+Опционально:
+- `OPENAI_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+### Тесты
+```bash
+pytest -q
+```
+
+### Примечание
+- Поведение на реальной Bybit проверяйте в вашей рабочей среде.

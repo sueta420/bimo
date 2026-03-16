@@ -91,6 +91,9 @@ class Agent:
             return f"fixed_notional=${float(self.cfg.get('target_notional_usd', 0) or 0):.4f}"
         return f"risk_pct={float(self.cfg.get('risk_per_trade_pct', 0) or 0):.4f}%"
 
+    def _side_risk_guard_label(self) -> str:
+        return "disabled" if self.cfg.get("disable_side_risk_guard", False) else "enabled"
+
     def _load_local_state(self):
         for t in self.store.load_active_trades():
             self.open_trades[t.symbol] = t
@@ -516,17 +519,23 @@ class Agent:
                     self.log.info(f"skip symbol={sym} reason={reject_reason}")
                     continue
 
-                ok_side, side_reason = check_side_exposure(
-                    self.cfg,
-                    self.open_trades,
-                    direction,
-                    sizing["risk_usd"],
-                    float(wallet.get("equity", 0) or 0),
-                )
-                if not ok_side:
-                    self.stats.skipped += 1
-                    self.log.info(f"skip symbol={sym} reason={side_reason}")
-                    continue
+                if self.cfg.get("disable_side_risk_guard", False):
+                    self.log.warning(
+                        f"side_risk_guard_disabled symbol={sym} risk_usd={sizing['risk_usd']:.4f} "
+                        f"max_side_risk_pct={self.cfg['max_side_risk_pct']}"
+                    )
+                else:
+                    ok_side, side_reason = check_side_exposure(
+                        self.cfg,
+                        self.open_trades,
+                        direction,
+                        sizing["risk_usd"],
+                        float(wallet.get("equity", 0) or 0),
+                    )
+                    if not ok_side:
+                        self.stats.skipped += 1
+                        self.log.info(f"skip symbol={sym} reason={side_reason}")
+                        continue
 
                 return_series = {sym: self._symbol_returns(sym)}
                 for t in self.open_trades.values():
@@ -631,11 +640,13 @@ class Agent:
     async def run(self):
         mode = "TESTNET" if self.cfg["testnet"] else "*** REAL MONEY ***"
         self.log.info(
-            f"agent_start mode={mode} model={self.cfg['llm_model']} sizing={self._sizing_label()}"
+            f"agent_start mode={mode} model={self.cfg['llm_model']} sizing={self._sizing_label()} "
+            f"side_risk_guard={self._side_risk_guard_label()}"
         )
         self.tg.send(
             f"Агент запущен\nРежим: {mode}\nМодель: {self.cfg['llm_model']}\n"
-            f"Sizing: {self._sizing_label()} | Max/day: {self.cfg['max_trades_per_day']}",
+            f"Sizing: {self._sizing_label()} | SideRiskGuard: {self._side_risk_guard_label()} | "
+            f"Max/day: {self.cfg['max_trades_per_day']}",
             force=True,
         )
         while True:
