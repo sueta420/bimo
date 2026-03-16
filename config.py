@@ -56,6 +56,14 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = str(raw).strip()
+    return v if v else default
+
+
 def build_config() -> dict[str, Any]:
     load_dotenv_file(os.path.join(BASE_DIR, ".env"))
     return {
@@ -67,7 +75,10 @@ def build_config() -> dict[str, Any]:
         "enable_llm": env_bool("ENABLE_LLM", True),
         "use_llm_secondary_rank": env_bool("USE_LLM_SECONDARY_RANK", False),
         "llm_rank_top_n": env_int("LLM_RANK_TOP_N", 3),
+        "position_sizing_mode": env_str("POSITION_SIZING_MODE", "risk_pct").lower(),
         "risk_per_trade_pct": env_float("RISK_PER_TRADE_PCT", 0.5),
+        "risk_per_trade_usd": env_float("RISK_PER_TRADE_USD", 0.0),
+        "target_notional_usd": env_float("TARGET_NOTIONAL_USD", 5.0),
         "max_side_risk_pct": env_float("MAX_SIDE_RISK_PCT", 1.5),
         "slippage_entry_bps": env_float("SLIPPAGE_ENTRY_BPS", 10.0),
         "slippage_exit_bps": env_float("SLIPPAGE_EXIT_BPS", 15.0),

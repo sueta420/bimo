@@ -90,3 +90,41 @@ def test_size_position_rejects_missing_qty_step():
     res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
     assert res is None
     assert err == "qty_step<=0"
+
+
+def test_size_position_with_fixed_risk_usd_mode():
+    cfg = {
+        "position_sizing_mode": "risk_usd",
+        "risk_per_trade_usd": 2.0,
+        "slippage_entry_bps": 10,
+        "slippage_exit_bps": 15,
+        "taker_fee_bps": 5.5,
+        "funding_reserve_rate": 0.0005,
+        "max_leverage": 10,
+    }
+    wallet = {"equity": 31, "available": 31}
+    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
+    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
+    assert err == ""
+    assert res["sizing_mode"] == "risk_usd"
+    assert res["risk_budget_usd"] == 2.0
+    assert res["risk_usd"] <= 2.04
+
+
+def test_size_position_with_fixed_notional_mode():
+    cfg = {
+        "position_sizing_mode": "fixed_notional_usd",
+        "target_notional_usd": 5.0,
+        "slippage_entry_bps": 10,
+        "slippage_exit_bps": 15,
+        "taker_fee_bps": 5.5,
+        "funding_reserve_rate": 0.0005,
+        "max_leverage": 10,
+    }
+    wallet = {"equity": 31, "available": 31}
+    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
+    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
+    assert err == ""
+    assert res["sizing_mode"] == "fixed_notional_usd"
+    assert res["notional"] >= 5.0
+    assert res["notional"] < 5.2

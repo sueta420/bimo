@@ -17,7 +17,7 @@ from portfolio import (
     StateStore,
     Trade,
 )
-from risk import check_side_exposure, correlation_allowed, returns_from_prices, round_to_step, size_position
+from risk import check_side_exposure, correlation_allowed, normalize_sizing_mode, returns_from_prices, round_to_step, size_position
 from signals import (
     calc_indicators,
     detect_signals,
@@ -82,6 +82,14 @@ class Agent:
         self._save_trade(t)
         if prev != new_state:
             self.store.add_event(t.id, t.symbol, prev, new_state, reason, payload or {})
+
+    def _sizing_label(self) -> str:
+        mode = normalize_sizing_mode(self.cfg.get("position_sizing_mode", "risk_pct"))
+        if mode == "risk_usd":
+            return f"risk_usd=${float(self.cfg.get('risk_per_trade_usd', 0) or 0):.4f}"
+        if mode == "fixed_notional_usd":
+            return f"fixed_notional=${float(self.cfg.get('target_notional_usd', 0) or 0):.4f}"
+        return f"risk_pct={float(self.cfg.get('risk_per_trade_pct', 0) or 0):.4f}%"
 
     def _load_local_state(self):
         for t in self.store.load_active_trades():
@@ -544,10 +552,12 @@ class Agent:
 
     async def run(self):
         mode = "TESTNET" if self.cfg["testnet"] else "*** REAL MONEY ***"
-        self.log.info(f"agent_start mode={mode} model={self.cfg['llm_model']} risk_per_trade_pct={self.cfg['risk_per_trade_pct']}")
+        self.log.info(
+            f"agent_start mode={mode} model={self.cfg['llm_model']} sizing={self._sizing_label()}"
+        )
         self.tg.send(
             f"Агент запущен\nРежим: {mode}\nМодель: {self.cfg['llm_model']}\n"
-            f"Risk/trade: {self.cfg['risk_per_trade_pct']}% | Max/day: {self.cfg['max_trades_per_day']}",
+            f"Sizing: {self._sizing_label()} | Max/day: {self.cfg['max_trades_per_day']}",
             force=True,
         )
         while True:

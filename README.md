@@ -31,6 +31,20 @@
 - `main.py`
 - `futures_agent_v2.py` (compat wrapper)
 
+## Position sizing modes
+- `POSITION_SIZING_MODE=risk_pct`:
+  uses `RISK_PER_TRADE_PCT` from equity (default)
+- `POSITION_SIZING_MODE=risk_usd`:
+  uses fixed `RISK_PER_TRADE_USD` per trade
+- `POSITION_SIZING_MODE=fixed_notional_usd`:
+  uses fixed `TARGET_NOTIONAL_USD` position size
+
+Example:
+```bash
+POSITION_SIZING_MODE=fixed_notional_usd
+TARGET_NOTIONAL_USD=5.0
+```
+
 ## Setup
 ```bash
 python3 -m pip install -r requirements.txt
