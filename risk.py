@@ -1,4 +1,5 @@
 import math
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Optional
 
 import numpy as np
@@ -9,19 +10,28 @@ from portfolio import ACTIVE_STATES, Trade, side_exposure_risk
 def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
-    return math.floor(value / step) * step
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    q = (v / s).to_integral_value(rounding=ROUND_DOWN)
+    return float(q * s)
 
 
 def ceil_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
-    return math.ceil(value / step) * step
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    q = (v / s).to_integral_value(rounding=ROUND_UP)
+    return float(q * s)
 
 
 def round_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
-    return round(round(value / step) * step, 12)
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    q = (v / s).to_integral_value(rounding=ROUND_HALF_UP)
+    return float(q * s)
 
 
 def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
@@ -59,6 +69,8 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
     min_qty = float(limits.get("min_qty", 0) or 0)
     min_notional = float(limits.get("min_notional", 0) or 0)
     tick_size = float(limits.get("tick_size", 0) or 0)
+    if qty_step <= 0:
+        return None, "qty_step<=0"
 
     entry_adj = round_to_step(entry_px, tick_size)
     sl_adj = round_to_step(sl_px, tick_size)
@@ -68,9 +80,12 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
         return None, "qty<=0 after rounding"
 
     if qty < min_qty:
-        qty = min_qty
+        qty = ceil_to_step(min_qty, qty_step)
     if min_notional > 0 and (qty * entry_adj) < min_notional:
         qty = ceil_to_step(min_notional / entry_adj, qty_step) if qty_step > 0 else (min_notional / entry_adj)
+    qty = floor_to_step(qty, qty_step)
+    if qty < min_qty:
+        return None, "qty<min_qty after rounding"
 
     notional = qty * entry_adj
     if available <= 0:

@@ -1,4 +1,5 @@
 import time
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Optional
 
 import pandas as pd
@@ -18,6 +19,47 @@ def sum_realized_pnl(rows: list[dict], pnl_field: str, ts_field: str, open_time_
         except Exception:
             continue
     return round(total, 6) if got else None
+
+
+def _d(value) -> Decimal:
+    return Decimal(str(value))
+
+
+def _fmt_decimal(value: Decimal) -> str:
+    s = format(value, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def normalize_order_qty(
+    qty: float,
+    qty_step: float,
+    min_qty: float,
+    min_notional: float = 0.0,
+    ref_price: float = 0.0,
+) -> str:
+    q = _d(qty)
+    step = _d(qty_step)
+    minimum = _d(min_qty)
+    min_notional_dec = _d(min_notional)
+    ref_price_dec = _d(ref_price)
+    if q <= 0:
+        raise ValueError("qty<=0")
+    if step <= 0:
+        raise ValueError("qty_step<=0")
+
+    q = (q / step).to_integral_value(rounding=ROUND_DOWN) * step
+    minimum = (minimum / step).to_integral_value(rounding=ROUND_UP) * step
+    if min_notional_dec > 0 and ref_price_dec > 0:
+        by_notional = (min_notional_dec / ref_price_dec / step).to_integral_value(rounding=ROUND_UP) * step
+        if by_notional > minimum:
+            minimum = by_notional
+    if q < minimum:
+        q = minimum
+    if q <= 0:
+        raise ValueError("qty<=0 after normalize")
+    return _fmt_decimal(q)
 
 
 class BybitClient:
@@ -80,6 +122,16 @@ class BybitClient:
 
     def place_order(self, symbol, direction, qty, sl, tp, leverage):
         side = "Buy" if direction == "LONG" else "Sell"
+        limits = self.instrument_constraints(symbol)
+        tick = self.ticker(symbol)
+        ref_price = float(tick.get("markPrice") or tick.get("lastPrice") or 0.0)
+        qty_str = normalize_order_qty(
+            qty,
+            limits["qty_step"],
+            limits["min_qty"],
+            limits.get("min_notional", 0.0),
+            ref_price,
+        )
         try:
             self.s.set_leverage(
                 category="linear",
@@ -94,7 +146,7 @@ class BybitClient:
             symbol=symbol,
             side=side,
             orderType="Market",
-            qty=str(qty),
+            qty=qty_str,
             stopLoss=str(round(sl, 6)),
             takeProfit=str(round(tp, 6)),
             slTriggerBy="MarkPrice",
@@ -104,12 +156,14 @@ class BybitClient:
 
     def close_pos(self, symbol, direction, qty):
         side = "Sell" if direction == "LONG" else "Buy"
+        limits = self.instrument_constraints(symbol)
+        qty_str = normalize_order_qty(qty, limits["qty_step"], limits["min_qty"])
         self.s.place_order(
             category="linear",
             symbol=symbol,
             side=side,
             orderType="Market",
-            qty=str(qty),
+            qty=qty_str,
             reduceOnly=True,
         )
 
@@ -162,11 +216,13 @@ class BybitClient:
         lot = it.get("lotSizeFilter", {})
         price = it.get("priceFilter", {})
         data = {
-            "tick_size": float(price.get("tickSize", 0.0) or 0.0),
-            "qty_step": float(lot.get("qtyStep", 0.0) or 0.0),
-            "min_qty": float(lot.get("minOrderQty", 0.0) or 0.0),
-            "min_notional": float(lot.get("minNotionalValue", 0.0) or 0.0),
+            "tick_size": float(price.get("tickSize") or price.get("tick_size") or 0.0),
+            "qty_step": float(lot.get("qtyStep") or lot.get("qty_step") or 0.0),
+            "min_qty": float(lot.get("minOrderQty") or lot.get("min_qty") or 0.0),
+            "min_notional": float(lot.get("minNotionalValue") or lot.get("min_notional") or 0.0),
         }
+        if data["qty_step"] <= 0:
+            raise RuntimeError(f"invalid qty_step for {symbol}: {data}")
         self._instrument_cache[symbol] = data
         return data
 

@@ -2,7 +2,7 @@ import asyncio
 import time
 from datetime import datetime, timezone
 
-from exchange import BybitClient
+from exchange import BybitClient, normalize_order_qty
 from notifier import LLMExplainer, TelegramNotifier
 from portfolio import (
     ACTIVE_STATES,
@@ -480,6 +480,22 @@ class Agent:
                     open_time_ms=now_ms,
                     score=item["score"],
                     notes=", ".join(item["reasons"][:6]),
+                )
+                tick = self.ex.ticker(sym)
+                ref_price = float(tick.get("markPrice") or tick.get("lastPrice") or 0.0)
+                qty_final_str = normalize_order_qty(
+                    t.qty,
+                    float(limits.get("qty_step", 0.0) or 0.0),
+                    float(limits.get("min_qty", 0.0) or 0.0),
+                    float(limits.get("min_notional", 0.0) or 0.0),
+                    ref_price,
+                )
+                qty_raw = t.qty
+                t.qty = float(qty_final_str)
+                self.log.info(
+                    f"order_qty_prepare symbol={sym} qty_raw={qty_raw} qty_final={qty_final_str} "
+                    f"qty_step={limits.get('qty_step')} min_qty={limits.get('min_qty')} "
+                    f"min_notional={limits.get('min_notional')} ref_price={ref_price}"
                 )
                 self.open_trades[sym] = t
                 self._save_trade(t)

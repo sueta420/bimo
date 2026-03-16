@@ -1,5 +1,5 @@
 from portfolio import STATE_OPEN, Trade
-from risk import check_side_exposure, correlation_allowed, size_position
+from risk import check_side_exposure, correlation_allowed, floor_to_step, size_position
 
 
 def test_size_position_equity_based():
@@ -70,3 +70,23 @@ def test_correlation_guard_blocks():
     )
     assert not ok
     assert "corr_hits" in reason
+
+
+def test_floor_to_step_precision():
+    assert floor_to_step(0.0161, 0.01) == 0.01
+
+
+def test_size_position_rejects_missing_qty_step():
+    cfg = {
+        "risk_per_trade_pct": 0.5,
+        "slippage_entry_bps": 10,
+        "slippage_exit_bps": 15,
+        "taker_fee_bps": 5.5,
+        "funding_reserve_rate": 0.0005,
+        "max_leverage": 10,
+    }
+    wallet = {"equity": 1000, "available": 1000}
+    limits = {"tick_size": 0.1, "qty_step": 0.0, "min_qty": 0.001, "min_notional": 5}
+    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
+    assert res is None
+    assert err == "qty_step<=0"
