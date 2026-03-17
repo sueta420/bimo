@@ -186,12 +186,11 @@ class Agent:
     def day_reset(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.stats.date:
-            open_before_close = len(self.open_trades)
-            self.close_all("new_day")
+            open_positions = len(self.open_trades)
             report, path = make_report(self.stats, self.cfg["max_trades_per_day"])
             self.log.info(f"report_path={path}")
             print(report)
-            self.tg.send(self.day_summary_text("Суточный отчёт агента", open_before_close), force=True)
+            self.tg.send(self.day_summary_text("Суточный отчёт агента", open_positions), force=True)
             self.stats = DayStats(date=today)
 
     def _manage_protection(self, t: Trade, pos: dict):
@@ -333,10 +332,6 @@ class Agent:
             f"cycle_start ts={now.isoformat()} open_positions={len(self.open_trades)} "
             f"closed_today={len(self.stats.trades)} skipped_today={self.stats.skipped}"
         )
-        if now.hour == self.cfg["close_hour_utc"] and now.minute >= self.cfg["close_min_utc"]:
-            self.log.info("cycle_eod_close_triggered=true")
-            self.close_all("eod_close")
-            return
 
         self.sync_trades()
         if self.stats.stopped:
