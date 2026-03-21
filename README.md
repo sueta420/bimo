@@ -60,6 +60,11 @@ Optional:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
+### Crash Alerts
+- If Telegram is configured, fatal startup/runtime crashes now trigger a forced crash message with host, PID and traceback.
+- This does not cover hard kills outside Python process control (`SIGKILL`, OOM-killer, host reboot/power loss).
+- For full reliability in production, run the agent under `systemd`/`supervisor` with auto-restart and external health monitoring.
+
 ### Tests
 ```bash
 pytest -q
@@ -127,6 +132,11 @@ python3 futures_agent_v2.py
 - `OPENAI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+
+### Аварийные уведомления
+- Если Telegram настроен, при фатальном падении на старте/рантайме отправляется принудительное сообщение с host, PID и traceback.
+- Этот механизм не покрывает «жёсткие» остановки вне контроля Python-процесса (`SIGKILL`, OOM-killer, перезагрузка/потеря питания хоста).
+- Для продакшена используйте запуск через `systemd`/`supervisor` с авто-перезапуском и внешним health-monitoring.
 
 ### Тесты
 ```bash
