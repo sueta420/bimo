@@ -1,8 +1,9 @@
 .env
+*.env
 __pycache__/
 *.pyc
-.pytest_cache/
-agent_*.log
-report_*.txt
-agent_state*.sqlite3
+*.pyo
+*.pyd
+.vscode/
+.idea/
 .DS_Store

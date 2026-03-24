@@ -187,7 +187,7 @@ class Agent:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.stats.date:
             open_before_close = len(self.open_trades)
-            self.close_all("new_day")
+            # self.close_all("new_day")
             report, path = make_report(self.stats, self.cfg["max_trades_per_day"])
             self.log.info(f"report_path={path}")
             print(report)
