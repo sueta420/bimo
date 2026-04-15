@@ -57,6 +57,13 @@ class DayStats:
     skipped: int = 0
     consecutive_losses: int = 0
     stopped: bool = False
+    critical_errors: int = 0
+    halt_reason: str = ""
+
+
+@dataclass
+class SessionState:
+    day_stats: DayStats = field(default_factory=DayStats)
 
 
 def side_exposure_risk(open_trades: dict[str, Trade]) -> dict[str, float]:
@@ -125,6 +132,15 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS symbol_rules (
                 symbol TEXT PRIMARY KEY,
                 cooldown_until TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_state (
+                key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -241,3 +257,30 @@ class StateStore:
         if not until:
             return False
         return datetime.now(timezone.utc) < until
+
+    def save_day_stats(self, stats: DayStats):
+        payload = json.dumps(asdict(stats), ensure_ascii=False)
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO session_state (key, payload_json, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
+            """,
+            ("day_stats", payload, now),
+        )
+        self.conn.commit()
+
+    def load_day_stats(self) -> Optional[DayStats]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT payload_json FROM session_state WHERE key=?", ("day_stats",))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+            trades = [Trade(**item) for item in payload.get("trades", [])]
+            payload["trades"] = trades
+            return DayStats(**payload)
+        except Exception:
+            return None

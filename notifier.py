@@ -112,16 +112,24 @@ class LLMExplainer:
             {
                 "symbol": x.get("sym"),
                 "score": x.get("score"),
+                "rr": round(float(x.get("rr", 0.0) or 0.0), 3),
                 "direction": x.get("sig", {}).get("direction"),
                 "strategy": x.get("sig", {}).get("strategy"),
                 "risk_usd": x.get("sizing", {}).get("risk_usd"),
+                "funding": round(float(x.get("fr", 0.0) or 0.0), 6),
+                "oi_change_pct": round(float(x.get("oi", {}).get("change_pct", 0.0) or 0.0), 3),
+                "edge_cost_ratio": round(float(x.get("edge", {}).get("edge_cost_ratio", 0.0) or 0.0), 3),
+                "net_reward_pct": round(float(x.get("edge", {}).get("net_reward_pct", 0.0) or 0.0), 3),
+                "atr_ratio": round(float(x.get("ind", {}).get("atr", 0.0) or 0.0) / max(float(x.get("ind", {}).get("price", 1.0) or 1.0), 1e-9), 6),
+                "reasons": list(x.get("reasons", [])[:5]),
             }
             for x in items
         ]
         prompt = (
             "Отранжируй кандидаты от лучшего к худшему. "
             "Входные данные уже прошли риск-фильтры. "
-            "Ответь JSON-массивом символов в порядке приоритета.\n"
+            "Отдавай приоритет чистой структуре, адекватному rr, устойчивому режиму и нормальному oi/funding. "
+            "Не выдумывай новые данные. Ответь только JSON-массивом символов в порядке приоритета.\n"
             f"{json.dumps(brief, ensure_ascii=False)}"
         )
         txt = self._ask(prompt, max_tokens=180)

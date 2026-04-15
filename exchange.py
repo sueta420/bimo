@@ -32,6 +32,78 @@ def _fmt_decimal(value: Decimal) -> str:
     return s or "0"
 
 
+def _first_non_empty(*values):
+    for value in values:
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def normalize_order_status(row: dict) -> dict:
+    raw_status = str(
+        _first_non_empty(
+            row.get("orderStatus"),
+            row.get("order_status"),
+            row.get("status"),
+            "UNKNOWN",
+        )
+    )
+    filled_qty = float(
+        _first_non_empty(
+            row.get("cumExecQty"),
+            row.get("cum_exec_qty"),
+            row.get("cumFilledQty"),
+            row.get("cum_filled_qty"),
+            0.0,
+        )
+        or 0.0
+    )
+    avg_price = float(
+        _first_non_empty(
+            row.get("avgPrice"),
+            row.get("avg_price"),
+            row.get("price"),
+            0.0,
+        )
+        or 0.0
+    )
+    reject_reason = str(
+        _first_non_empty(
+            row.get("rejectReason"),
+            row.get("reject_reason"),
+            row.get("cancelType"),
+            row.get("cancel_type"),
+            "",
+        )
+        or ""
+    )
+
+    status_upper = raw_status.upper()
+    if status_upper in {"NEW", "CREATED", "UNTRIGGERED", "TRIGGERED", "ACTIVE", "PENDING"}:
+        normalized = "PENDING"
+    elif status_upper in {"PARTIALLYFILLED", "PARTIALLY_FILLED"}:
+        normalized = "PARTIALLY_FILLED"
+    elif status_upper in {"FILLED"}:
+        normalized = "FILLED"
+    elif status_upper in {"CANCELLED", "CANCELED", "DEACTIVATED"}:
+        normalized = "CANCELLED"
+    elif status_upper in {"REJECTED"}:
+        normalized = "REJECTED"
+    elif status_upper in {"PARTIALLYFILLEDCANCELED", "PARTIALLY_FILLED_CANCELED"}:
+        normalized = "PARTIALLY_FILLED_CANCELED"
+    else:
+        normalized = "UNKNOWN"
+
+    return {
+        "status": normalized,
+        "raw_status": raw_status,
+        "filled_qty": filled_qty,
+        "avg_price": avg_price,
+        "reject_reason": reject_reason,
+        "order_id": str(_first_non_empty(row.get("orderId"), row.get("order_id"), "") or ""),
+    }
+
+
 def normalize_order_qty(
     qty: float,
     qty_step: float,
@@ -242,3 +314,29 @@ class BybitClient:
             return sum_realized_pnl(rows, pnl_field="closedPnl", ts_field="updatedTime", open_time_ms=open_time_ms)
         except Exception:
             return None
+
+    def get_order_state(self, symbol: str, order_id: str) -> Optional[dict]:
+        if not order_id:
+            return None
+
+        try:
+            r = self.s.get_open_orders(category="linear", symbol=symbol, orderId=order_id)
+            rows = r.get("result", {}).get("list", [])
+            for row in rows:
+                current_id = str(_first_non_empty(row.get("orderId"), row.get("order_id"), "") or "")
+                if current_id == order_id:
+                    return normalize_order_status(row)
+        except Exception:
+            pass
+
+        try:
+            r = self.s.get_order_history(category="linear", symbol=symbol, orderId=order_id, limit=20)
+            rows = r.get("result", {}).get("list", [])
+            for row in rows:
+                current_id = str(_first_non_empty(row.get("orderId"), row.get("order_id"), "") or "")
+                if current_id == order_id:
+                    return normalize_order_status(row)
+        except Exception:
+            pass
+
+        return None

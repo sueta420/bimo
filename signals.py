@@ -102,18 +102,128 @@ def screen_coins(ex, cfg):
     return [s for s, _ in result[:20]]
 
 
-def regime_filter(ind1h, ind4h, direction: str) -> tuple[bool, str]:
+def _regime_profile(ind: dict) -> dict:
+    price = float(ind.get("price") or 0.0)
+    ema20 = float(ind.get("ema20") or 0.0)
+    ema50 = float(ind.get("ema50") or 0.0)
+    ema200 = float(ind.get("ema200") or 0.0)
+    atr = float(ind.get("atr") or 0.0)
+    vol_ratio = float(ind.get("vol_ratio") or 100.0)
+    if min(price, ema20, ema50, ema200) <= 0:
+        return {"bias": "missing", "trend_strength": 0.0, "compression": 1.0, "atr_ratio": 0.0, "vol_ratio": vol_ratio}
+
+    spread_fast = abs(ema20 - ema50) / price
+    spread_slow = abs(ema50 - ema200) / price
+    compression = spread_fast + spread_slow
+    atr_ratio = atr / price if price > 0 else 0.0
+
+    bull_strong = price > ema20 > ema50 > ema200
+    bear_strong = price < ema20 < ema50 < ema200
+    bull_soft = price > ema200 and ema20 >= ema50
+    bear_soft = price < ema200 and ema20 <= ema50
+
+    if compression < 0.004 and atr_ratio < 0.006:
+        bias = "flat"
+    elif compression < 0.006 and atr_ratio < 0.008:
+        bias = "chop"
+    elif bull_strong:
+        bias = "bull_expansion" if atr_ratio >= 0.009 or vol_ratio >= 140 else "bull_trend"
+    elif bear_strong:
+        bias = "bear_expansion" if atr_ratio >= 0.009 or vol_ratio >= 140 else "bear_trend"
+    elif bull_soft:
+        bias = "bull_soft"
+    elif bear_soft:
+        bias = "bear_soft"
+    else:
+        bias = "mixed"
+
+    return {
+        "bias": bias,
+        "trend_strength": round(compression, 6),
+        "compression": round(compression, 6),
+        "atr_ratio": round(atr_ratio, 6),
+        "vol_ratio": round(vol_ratio, 2),
+        "price": price,
+    }
+
+
+def _same_side_biases(direction: str) -> set[str]:
+    return {"bull_expansion", "bull_trend", "bull_soft"} if direction == "LONG" else {"bear_expansion", "bear_trend", "bear_soft"}
+
+
+def _opp_side_biases(direction: str) -> set[str]:
+    return {"bear_expansion", "bear_trend", "bear_soft"} if direction == "LONG" else {"bull_expansion", "bull_trend", "bull_soft"}
+
+
+def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> tuple[bool, str]:
     try:
-        p1, a1, b1, c1 = ind1h["price"], ind1h["ema20"], ind1h["ema50"], ind1h["ema200"]
-        p4, a4, b4, c4 = ind4h["price"], ind4h["ema20"], ind4h["ema50"], ind4h["ema200"]
+        r1 = _regime_profile(ind1h)
+        r4 = _regime_profile(ind4h)
     except Exception:
         return False, "missing_regime_data"
 
-    if direction == "LONG":
-        ok = p1 > c1 and a1 >= b1 and p4 > c4 and a4 >= b4
-    else:
-        ok = p1 < c1 and a1 <= b1 and p4 < c4 and a4 <= b4
+    same_side = _same_side_biases(direction)
+    opp_side = _opp_side_biases(direction)
+    opposite_expansion = "bear_expansion" if direction == "LONG" else "bull_expansion"
+
+    if strategy == "reversal":
+        if r1["bias"] == opposite_expansion or r4["bias"] == opposite_expansion:
+            return False, "regime_reversal_vs_expansion"
+        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
+            return False, "regime_flat"
+        return True, ""
+
+    if strategy == "fakeout":
+        if r4["bias"] in opp_side and r4["bias"] != ("bear_soft" if direction == "LONG" else "bull_soft"):
+            return False, "regime_countertrend"
+        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
+            return False, "regime_flat"
+        ok = (
+            r1["bias"] in (same_side | {"mixed", "flat"})
+            and r4["bias"] in (same_side | {"mixed", "flat"})
+        )
+        return ok, "" if ok else "regime_mismatch"
+
+    if r1["bias"] in opp_side or r4["bias"] in opp_side:
+        return False, "regime_countertrend"
+    if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
+        return False, "regime_flat"
+    if r1["bias"] == "chop":
+        return False, "regime_chop"
+    ok = (
+        r1["bias"] in same_side
+        and r4["bias"] in (same_side | {"mixed"})
+        and (
+            r1["bias"] in {"bull_expansion", "bull_trend", "bear_expansion", "bear_trend"}
+            or r4["bias"] in {"bull_expansion", "bull_trend", "bear_expansion", "bear_trend"}
+        )
+    )
     return ok, "" if ok else "regime_mismatch"
+
+
+def edge_after_costs(sig: dict, cfg: dict, funding: float) -> dict:
+    entry = float(sig.get("entry") or 0.0)
+    tp = float(sig.get("tp") or 0.0)
+    if entry <= 0 or tp <= 0:
+        return {"cost_per_unit": 0.0, "gross_reward_per_unit": 0.0, "net_reward_per_unit": 0.0, "edge_cost_ratio": 0.0, "net_reward_pct": 0.0}
+
+    slip_in = float(cfg.get("slippage_entry_bps", 0) or 0) / 10_000.0
+    slip_out = float(cfg.get("slippage_exit_bps", 0) or 0) / 10_000.0
+    taker_fee = float(cfg.get("taker_fee_bps", 0) or 0) / 10_000.0
+    funding_reserve = max(abs(float(funding or 0.0)), float(cfg.get("funding_reserve_rate", 0.0) or 0.0))
+
+    gross_reward = abs(tp - entry)
+    cost_per_unit = (entry * slip_in) + (tp * slip_out) + ((entry + tp) * taker_fee) + (entry * funding_reserve)
+    net_reward = gross_reward - cost_per_unit
+    edge_cost_ratio = (gross_reward / cost_per_unit) if cost_per_unit > 0 else 0.0
+    net_reward_pct = (net_reward / entry) if entry > 0 else 0.0
+    return {
+        "cost_per_unit": round(cost_per_unit, 6),
+        "gross_reward_per_unit": round(gross_reward, 6),
+        "net_reward_per_unit": round(net_reward, 6),
+        "edge_cost_ratio": round(edge_cost_ratio, 6),
+        "net_reward_pct": round(net_reward_pct * 100.0, 6),
+    }
 
 
 def in_funding_block(next_funding_ms: int, block_minutes: int) -> bool:
@@ -168,17 +278,31 @@ def score_signal(sig: dict, ind: dict, funding: float, oi_change_pct: float, reg
     atr = float(ind.get("atr") or 0)
     price = float(ind.get("price") or 1)
     atr_ratio = atr / price if price else 0
+    support = float(ind.get("support") or price)
+    resistance = float(ind.get("resistance") or price)
+    entry = float(sig.get("entry") or price)
+    sl = float(sig.get("sl") or entry)
+    tp = float(sig.get("tp") or entry)
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    rr = reward / risk if risk > 0 else 0.0
+    range_size = max(resistance - support, 1e-9)
+    range_frac = (entry - support) / range_size
 
     if sig["direction"] == "LONG":
         if rsi < 45:
             score += 8
+            reasons.append("rsi_long_supportive")
         if mh > 0:
             score += 8
+            reasons.append("macd_long_supportive")
     else:
         if rsi > 55:
             score += 8
+            reasons.append("rsi_short_supportive")
         if mh < 0:
             score += 8
+            reasons.append("macd_short_supportive")
 
     if vol >= 140:
         score += 8
@@ -186,16 +310,78 @@ def score_signal(sig: dict, ind: dict, funding: float, oi_change_pct: float, reg
     if atr_ratio >= 0.008:
         score += 6
         reasons.append("high_atr")
+    if 0.004 <= atr_ratio <= 0.02:
+        score += 3
+        reasons.append("tradable_volatility")
     if abs(funding) < 0.0008:
         score += 4
+        reasons.append("funding_ok")
     if abs(oi_change_pct) > 6:
         score -= 10
         reasons.append("oi_jump")
+    if abs(oi_change_pct) <= 3:
+        score += 3
+        reasons.append("oi_stable")
+
+    if rr >= 3.5:
+        score += 6
+        reasons.append("rr_excellent")
+    elif rr >= 3.0:
+        score += 3
+        reasons.append("rr_good")
+    elif rr < 2.5:
+        score -= 12
+        reasons.append("rr_weak")
 
     if sig["strategy"] == "breakout":
         score += 3
-    if sig["strategy"] == "reversal":
+        if sig["direction"] == "LONG":
+            if range_frac >= 0.98:
+                score += 5
+                reasons.append("clean_breakout_edge")
+            elif range_frac < 0.9:
+                score -= 8
+                reasons.append("breakout_not_extended")
+        else:
+            if range_frac <= 0.02:
+                score += 5
+                reasons.append("clean_breakout_edge")
+            elif range_frac > 0.1:
+                score -= 8
+                reasons.append("breakout_not_extended")
+    elif sig["strategy"] == "fakeout":
+        if sig["direction"] == "LONG":
+            if range_frac <= 0.15:
+                score += 6
+                reasons.append("fakeout_near_support")
+            elif range_frac > 0.35:
+                score -= 6
+                reasons.append("fakeout_far_from_edge")
+        else:
+            if range_frac >= 0.85:
+                score += 6
+                reasons.append("fakeout_near_resistance")
+            elif range_frac < 0.65:
+                score -= 6
+                reasons.append("fakeout_far_from_edge")
+    elif sig["strategy"] == "reversal":
         score -= 1
+        if atr_ratio > 0.015:
+            score -= 4
+            reasons.append("reversal_too_volatile")
+        if sig["direction"] == "LONG" and price > (float(ind.get("ema200") or price) * 1.01):
+            score -= 5
+            reasons.append("reversal_far_from_mean")
+        if sig["direction"] == "SHORT" and price < (float(ind.get("ema200") or price) * 0.99):
+            score -= 5
+            reasons.append("reversal_far_from_mean")
+
+    if abs(float(ind.get("ema20") or price) - float(ind.get("ema50") or price)) / price >= 0.003:
+        score += 3
+        reasons.append("ema_separation")
+    else:
+        score -= 4
+        reasons.append("ema_compression")
 
     score = int(max(0, min(100, score)))
     return score, reasons

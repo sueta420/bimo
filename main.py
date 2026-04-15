@@ -4,15 +4,27 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from config import CONFIG
 from execution import Agent
 
 
+def resolve_session_tz(name: str):
+    try:
+        return ZoneInfo(str(name or "UTC"))
+    except Exception:
+        return timezone.utc
+
+
 class JsonFormatter(logging.Formatter):
+    def __init__(self, session_tz):
+        super().__init__()
+        self.session_tz = session_tz
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(self.session_tz).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
@@ -25,7 +37,8 @@ class JsonFormatter(logging.Formatter):
 
 
 def init_logging(cfg):
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    session_tz = resolve_session_tz(cfg.get("session_timezone", "UTC"))
+    date_str = datetime.now(session_tz).strftime("%Y-%m-%d")
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"agent_{date_str}.log")
     root = logging.getLogger()
     root.handlers = []
@@ -34,7 +47,7 @@ def init_logging(cfg):
     stream = logging.StreamHandler()
     fileh = logging.FileHandler(log_path, encoding="utf-8")
     if cfg.get("log_json", True):
-        fmt = JsonFormatter()
+        fmt = JsonFormatter(session_tz)
     else:
         fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     stream.setFormatter(fmt)

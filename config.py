@@ -56,6 +56,14 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = str(raw).strip()
+    return v if v else default
+
+
 def build_config() -> dict[str, Any]:
     load_dotenv_file(os.path.join(BASE_DIR, ".env"))
     return {
@@ -67,7 +75,16 @@ def build_config() -> dict[str, Any]:
         "enable_llm": env_bool("ENABLE_LLM", True),
         "use_llm_secondary_rank": env_bool("USE_LLM_SECONDARY_RANK", False),
         "llm_rank_top_n": env_int("LLM_RANK_TOP_N", 3),
+        "llm_rank_min_score": env_int("LLM_RANK_MIN_SCORE", 72),
+        "llm_rank_max_score_spread": env_int("LLM_RANK_MAX_SCORE_SPREAD", 6),
+        "position_sizing_mode": env_str("POSITION_SIZING_MODE", "risk_pct").lower(),
         "risk_per_trade_pct": env_float("RISK_PER_TRADE_PCT", 0.5),
+        "risk_per_trade_usd": env_float("RISK_PER_TRADE_USD", 0.0),
+        "target_notional_usd": env_float("TARGET_NOTIONAL_USD", 5.0),
+        "max_risk_per_trade_usd": env_float("MAX_RISK_PER_TRADE_USD", 0.0),
+        "min_rr_ratio": env_float("MIN_RR_RATIO", 3.0),
+        "min_edge_cost_ratio": env_float("MIN_EDGE_COST_RATIO", 2.0),
+        "min_net_reward_pct": env_float("MIN_NET_REWARD_PCT", 0.25),
         "max_side_risk_pct": env_float("MAX_SIDE_RISK_PCT", 1.5),
         "slippage_entry_bps": env_float("SLIPPAGE_ENTRY_BPS", 10.0),
         "slippage_exit_bps": env_float("SLIPPAGE_EXIT_BPS", 15.0),
@@ -94,9 +111,14 @@ def build_config() -> dict[str, Any]:
         "correlation_threshold": env_float("CORRELATION_THRESHOLD", 0.85),
         "max_correlated_positions_per_side": env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2),
         "correlation_lookback": env_int("CORRELATION_LOOKBACK", 96),
+        "session_timezone": env_str("SESSION_TIMEZONE", "UTC"),
+        "enable_eod_close": env_bool("ENABLE_EOD_CLOSE", True),
         "close_hour_utc": env_int("CLOSE_HOUR_UTC", 23),
         "close_min_utc": env_int("CLOSE_MIN_UTC", 45),
         "cycle_sec": env_int("CYCLE_SEC", 900),
+        "close_verify_retries": env_int("CLOSE_VERIFY_RETRIES", 6),
+        "close_verify_delay_ms": env_int("CLOSE_VERIFY_DELAY_MS", 500),
+        "critical_error_stop_count": env_int("CRITICAL_ERROR_STOP_COUNT", 3),
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         "tg_min_interval_sec": env_int("TG_MIN_INTERVAL_SEC", 3),

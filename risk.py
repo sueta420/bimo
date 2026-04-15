@@ -7,6 +7,34 @@ import numpy as np
 from portfolio import ACTIVE_STATES, Trade, side_exposure_risk
 
 
+def normalize_sizing_mode(mode: str) -> str:
+    m = str(mode or "").strip().lower()
+    if m in ("risk_pct", "risk_percent", "percent"):
+        return "risk_pct"
+    if m in ("risk_usd", "fixed_risk_usd"):
+        return "risk_usd"
+    if m in ("fixed_notional_usd", "fixed_notional", "notional_usd"):
+        return "fixed_notional_usd"
+    return "risk_pct"
+
+
+def rr_ratio(entry: float, sl: float, tp: float, direction: str) -> float:
+    entry_px = float(entry or 0.0)
+    sl_px = float(sl or 0.0)
+    tp_px = float(tp or 0.0)
+    if entry_px <= 0:
+        return 0.0
+    if direction == "LONG":
+        risk = entry_px - sl_px
+        reward = tp_px - entry_px
+    else:
+        risk = sl_px - entry_px
+        reward = entry_px - tp_px
+    if risk <= 0 or reward <= 0:
+        return 0.0
+    return float(reward / risk)
+
+
 def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
@@ -39,10 +67,21 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
     available = float(wallet.get("available", 0) or 0)
     if equity <= 0:
         return None, "equity<=0"
-
-    risk_usd = equity * float(cfg["risk_per_trade_pct"]) / 100.0
-    if risk_usd <= 0:
-        return None, "risk_usd<=0"
+    mode = normalize_sizing_mode(cfg.get("position_sizing_mode", "risk_pct"))
+    risk_budget_usd = 0.0
+    target_notional_usd = 0.0
+    if mode == "risk_pct":
+        risk_budget_usd = equity * float(cfg.get("risk_per_trade_pct", 0) or 0) / 100.0
+        if risk_budget_usd <= 0:
+            return None, "risk_usd<=0"
+    elif mode == "risk_usd":
+        risk_budget_usd = float(cfg.get("risk_per_trade_usd", 0) or 0)
+        if risk_budget_usd <= 0:
+            return None, "risk_per_trade_usd<=0"
+    elif mode == "fixed_notional_usd":
+        target_notional_usd = float(cfg.get("target_notional_usd", 0) or 0)
+        if target_notional_usd <= 0:
+            return None, "target_notional_usd<=0"
 
     slip_in = float(cfg["slippage_entry_bps"]) / 10_000.0
     slip_out = float(cfg["slippage_exit_bps"]) / 10_000.0
@@ -74,7 +113,12 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
 
     entry_adj = round_to_step(entry_px, tick_size)
     sl_adj = round_to_step(sl_px, tick_size)
-    qty_raw = risk_usd / per_unit_loss
+    if mode == "fixed_notional_usd":
+        if entry_adj <= 0:
+            return None, "entry<=0"
+        qty_raw = target_notional_usd / entry_adj
+    else:
+        qty_raw = risk_budget_usd / per_unit_loss
     qty = floor_to_step(qty_raw, qty_step) if qty_step > 0 else qty_raw
     if qty <= 0:
         return None, "qty<=0 after rounding"
@@ -95,8 +139,11 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
         return None, f"notional>{max_notional:.4f}"
 
     effective_risk = qty * per_unit_loss
-    if effective_risk > risk_usd * 1.02:
-        return None, f"effective_risk>{risk_usd:.4f}"
+    max_risk_cap = float(cfg.get("max_risk_per_trade_usd", 0) or 0)
+    if max_risk_cap > 0 and effective_risk > max_risk_cap:
+        return None, f"risk_cap_exceeded {effective_risk:.4f}>{max_risk_cap:.4f}"
+    if mode != "fixed_notional_usd" and effective_risk > risk_budget_usd * 1.02:
+        return None, f"effective_risk>{risk_budget_usd:.4f}"
 
     req_lev = max(1, math.ceil(notional / available))
     if req_lev > int(cfg["max_leverage"]):
@@ -106,6 +153,8 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
         "qty": round(qty, 8),
         "leverage": int(req_lev),
         "risk_usd": round(effective_risk, 6),
+        "risk_budget_usd": round(risk_budget_usd, 6),
+        "sizing_mode": mode,
         "notional": round(notional, 6),
         "entry": entry_adj,
         "sl": sl_adj,
