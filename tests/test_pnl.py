@@ -1,4 +1,4 @@
-from exchange import normalize_order_qty, sum_realized_pnl
+from exchange import latest_realized_pnl, normalize_order_qty, sum_realized_pnl
 
 
 def test_sum_realized_pnl_with_time_filter():
@@ -14,6 +14,15 @@ def test_sum_realized_pnl_with_time_filter():
 def test_sum_realized_pnl_none_on_empty():
     v = sum_realized_pnl([], pnl_field="closedPnl", ts_field="updatedTime", open_time_ms=0)
     assert v is None
+
+
+def test_latest_realized_pnl_prefers_latest_closed_record():
+    rows = [
+        {"createdTime": "1000", "updatedTime": "1001", "closedPnl": "-0.25"},
+        {"createdTime": "2000", "updatedTime": "2001", "closedPnl": "-0.42"},
+    ]
+    v = latest_realized_pnl(rows, pnl_field="closedPnl", ts_fields=["createdTime", "updatedTime"], open_time_ms=1500)
+    assert v == -0.42
 
 
 def test_normalize_order_qty_by_step():

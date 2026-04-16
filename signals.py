@@ -87,9 +87,12 @@ def detect_signals(ind, funding):
 
 def screen_coins(ex, cfg):
     result = []
+    blacklist = {str(x).upper() for x in cfg.get("symbol_blacklist", [])}
     for t in ex.tickers():
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
+            continue
+        if sym.upper() in blacklist:
             continue
         try:
             vol = float(t.get("turnover24h", 0))
@@ -99,7 +102,42 @@ def screen_coins(ex, cfg):
         except Exception:
             continue
     result.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in result[:20]]
+    return [s for s, _ in result[: max(int(cfg.get("max_scan_symbols", 20) or 20), 1)]]
+
+
+def signal_quality_filter(sig: dict, ind: dict, cfg: dict, oi_change_pct: float = 0.0) -> tuple[bool, str]:
+    strategy = str(sig.get("strategy") or "")
+    if strategy != "fakeout":
+        return True, ""
+
+    price = float(ind.get("price") or sig.get("entry") or 0.0)
+    support = float(ind.get("support") or price)
+    resistance = float(ind.get("resistance") or price)
+    atr = float(ind.get("atr") or 0.0)
+    vol_ratio = float(ind.get("vol_ratio") or 0.0)
+    if price <= 0:
+        return False, "invalid_price"
+
+    atr_ratio = atr / price if price > 0 else 0.0
+    range_size = max(resistance - support, 1e-9)
+    range_frac = (float(sig.get("entry") or price) - support) / range_size
+    direction = str(sig.get("direction") or "")
+    edge_max = float(cfg.get("fakeout_edge_max_frac", 0.12) or 0.12)
+    max_atr_ratio = float(cfg.get("fakeout_max_atr_ratio", 0.012) or 0.012)
+    max_oi_change_pct = float(cfg.get("fakeout_max_oi_change_pct", 2.0) or 2.0)
+    min_vol_ratio = float(cfg.get("fakeout_min_vol_ratio", 90.0) or 90.0)
+
+    if direction == "LONG" and range_frac > edge_max:
+        return False, "fakeout_far_from_support"
+    if direction == "SHORT" and range_frac < (1.0 - edge_max):
+        return False, "fakeout_far_from_resistance"
+    if atr_ratio > max_atr_ratio:
+        return False, "fakeout_too_volatile"
+    if abs(float(oi_change_pct or 0.0)) > max_oi_change_pct:
+        return False, "fakeout_oi_unstable"
+    if vol_ratio < min_vol_ratio:
+        return False, "fakeout_volume_weak"
+    return True, ""
 
 
 def _regime_profile(ind: dict) -> dict:
@@ -199,6 +237,30 @@ def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> t
         )
     )
     return ok, "" if ok else "regime_mismatch"
+
+
+def btc_context_filter(symbol: str, sig: dict, btc1h: dict, btc4h: dict) -> tuple[bool, str]:
+    if str(symbol or "").upper() == "BTCUSDT":
+        return True, ""
+    direction = str(sig.get("direction") or "")
+    strategy = str(sig.get("strategy") or "")
+    r1 = _regime_profile(btc1h)
+    r4 = _regime_profile(btc4h)
+    same_side = _same_side_biases(direction)
+    opp_side = _opp_side_biases(direction)
+
+    if r1["bias"] in opp_side and r4["bias"] in opp_side:
+        return False, "btc_countertrend"
+    if strategy == "breakout" and r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
+        return False, "btc_chop"
+    if strategy == "fakeout":
+        if r1["bias"] in opp_side and r1["bias"] not in {"bull_soft", "bear_soft"}:
+            return False, "btc_fakeout_countertrend"
+        if r4["bias"] in opp_side and r4["bias"] not in {"bull_soft", "bear_soft"}:
+            return False, "btc_fakeout_countertrend"
+    if strategy == "reversal" and r4["bias"] in same_side and r1["bias"] in same_side:
+        return False, "btc_trend_not_exhausted"
+    return True, ""
 
 
 def edge_after_costs(sig: dict, cfg: dict, funding: float) -> dict:

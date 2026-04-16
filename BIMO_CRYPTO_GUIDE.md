@@ -21,6 +21,14 @@
 ### Runtime env
 - `/Users/bot/trading/.env`
 
+### Текущий боевой профиль
+- `POSITION_SIZING_MODE=fixed_margin_usd`
+- `TARGET_MARGIN_USD=10`
+- `TARGET_LEVERAGE=5`
+- `MAX_LEVERAGE=20`
+- `MAX_RISK_PER_TRADE_USD=1.5`
+- `MIN_RR_RATIO=3.0`
+
 ### LaunchAgent
 - `/Users/bot/Library/LaunchAgents/com.trading.agent.plist`
 
@@ -32,6 +40,9 @@
 - Читать последние строки логов
 - Объяснять `skip`-причины
 - Сводить результаты дня
+- Сводить стратегию по `fakeout / breakout / reversal`
+- Смотреть post-trade метрики: `realized_r`, `hold_minutes`, `mfe_r`, `mae_r`
+- Понимать разницу между `notional`, `margin`, `leverage` и `risk cap`
 - Предлагать изменения конфигурации
 - Помогать анализировать качество сигналов
 - Не лезть напрямую в торговые ключи без необходимости
@@ -72,6 +83,8 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 - `sync_trade_failed` — проблема синхронизации сделки
 - `close_all_failed` — ошибка при закрытии
 - `critical_error_stop_triggered` — kill switch остановил торговлю
+- `agent_restart_detected` — агент был недоступен и потом поднялся
+- `rate_limit_backoff` — агент уткнулся в лимит API и сузил сканирование
 
 ## Как правильно просить OpenClaw `crypto`
 Хорошие запросы:
@@ -80,6 +93,7 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 - “какие причины skip встречаются чаще всего”
 - “сделай короткий отчет за день”
 - “сравни текущий runtime env с рекомендованным профилем”
+- “объясни текущий режим sizing и какой сейчас реальный риск на сделку”
 
 Плохие запросы:
 - “сам прими сделку вместо агента”
@@ -89,7 +103,10 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 ## Что проверять перед боевым запуском
 - `TESTNET=false`
 - ключи Bybit соответствуют боевому режиму
-- `TARGET_NOTIONAL_USD` выставлен как нужно
+- `POSITION_SIZING_MODE` выставлен как нужно
+- если используется `fixed_notional_usd`, то `TARGET_NOTIONAL_USD` выставлен как нужно
+- если используется `fixed_margin_usd`, то `TARGET_MARGIN_USD` и `TARGET_LEVERAGE` выставлены как нужно
+- `MAX_LEVERAGE` не слишком агрессивен
 - `MAX_RISK_PER_TRADE_USD` не слишком агрессивен
 - `ENABLE_EOD_CLOSE=false`, если позиции должны жить до `SL/TP`
 - `SESSION_TIMEZONE=Europe/Moscow`, если нужен московский торговый день
@@ -117,3 +134,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trading.agent.plist
 - `bimo` отвечает за торговую механику
 - `OpenClaw crypto` отвечает за анализ, оркестрацию и сопровождение
 - пользователь отвечает за режим торговли, депозит и принятие риска
+
+## Как объяснять sizing правильно
+- `notional` — полный размер позиции
+- `margin` — сколько реальных средств выделено под позицию
+- `leverage` — во сколько раз notional больше margin
+- `MAX_RISK_PER_TRADE_USD` — не размер позиции, а потолок допустимого убытка по структуре сделки
+
+Пример текущего профиля:
+- `10 USDT margin @ 5x` = примерно `50 USDT notional`
+- при `MAX_RISK_PER_TRADE_USD=1.5` агент пропускает сделки, где структура требует большего убытка

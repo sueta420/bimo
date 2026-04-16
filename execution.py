@@ -18,7 +18,16 @@ from portfolio import (
     StateStore,
     Trade,
 )
-from risk import check_side_exposure, correlation_allowed, normalize_sizing_mode, returns_from_prices, round_to_step, rr_ratio, size_position
+from risk import (
+    align_protective_prices,
+    check_side_exposure,
+    correlation_allowed,
+    normalize_sizing_mode,
+    returns_from_prices,
+    round_to_step,
+    rr_ratio,
+    size_position,
+)
 from signals import (
     calc_indicators,
     detect_signals,
@@ -29,6 +38,7 @@ from signals import (
     regime_filter,
     score_signal,
     screen_coins,
+    signal_quality_filter,
 )
 
 
@@ -39,21 +49,26 @@ def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str 
     wr = len(wins) / len(stats.trades) * 100 if stats.trades else 0
     closed = len(stats.trades)
     lines = []
+    strategy_rows = _strategy_rows(stats.trades)
     for i, t in enumerate(stats.trades, 1):
         icon = "WIN" if (t.pnl_usd or 0) > 0 else ("LOSS" if (t.pnl_usd or 0) < 0 else "BE")
         lines.append(
             f"  #{i}[{icon}] {t.symbol} {t.direction} {t.strategy} "
-            f"PnL:{(t.pnl_usd or 0):+.4f}$ score:{t.score} {t.close_reason}"
+            f"PnL:{(t.pnl_usd or 0):+.4f}$ R:{(t.realized_r if t.realized_r is not None else 0):+.2f} "
+            f"Hold:{(t.hold_minutes if t.hold_minutes is not None else 0):.0f}m "
+            f"score:{t.score} {t.close_reason}"
         )
     report = (
         f"\n{'=' * 52}\n  ОТЧЁТ {stats.date} ({session_timezone})\n{'=' * 52}\n"
         f"  Сделок:{closed}/{max_trades_per_day} WIN:{len(wins)} LOSS:{len(losses)}\n"
         f"  Винрейт:{wr:.1f}% | PnL:{pnl:+.4f}$\n"
         f"  Сигналов:{stats.signals_total} | Скип:{stats.skipped} | Открыто:{stats.opened} | Закрыто:{closed}\n"
-        f"{'─' * 52}\n"
-        + ("\n".join(lines) if lines else "  Сделок не было")
-        + f"\n{'=' * 52}\n"
     )
+    if strategy_rows:
+        report += f"{'─' * 52}\n{strategy_rows}\n"
+    report += f"{'─' * 52}\n"
+    report += "\n".join(lines) if lines else "  Сделок не было"
+    report += f"\n{'=' * 52}\n"
     path = f"report_{stats.date.replace('-', '')}.txt"
     with open(path, "w", encoding="utf-8") as f:
         f.write(report)
@@ -63,6 +78,37 @@ def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str 
 def summarize_reasons(reasons: list[str], limit: int = 4) -> str:
     head = [str(x) for x in reasons[:limit] if str(x).strip()]
     return ",".join(head) if head else "-"
+
+
+def _strategy_rows(trades: list[Trade]) -> str:
+    if not trades:
+        return ""
+    grouped = {}
+    for t in trades:
+        bucket = grouped.setdefault(
+            t.strategy,
+            {"count": 0, "wins": 0, "pnl": 0.0, "r_sum": 0.0, "r_count": 0, "avg_hold": 0.0, "hold_count": 0},
+        )
+        bucket["count"] += 1
+        if (t.pnl_usd or 0) > 0:
+            bucket["wins"] += 1
+        bucket["pnl"] += float(t.pnl_usd or 0.0)
+        if t.realized_r is not None:
+            bucket["r_sum"] += float(t.realized_r)
+            bucket["r_count"] += 1
+        if t.hold_minutes is not None:
+            bucket["avg_hold"] += float(t.hold_minutes)
+            bucket["hold_count"] += 1
+    rows = []
+    for strategy, data in sorted(grouped.items()):
+        count = max(int(data["count"]), 1)
+        wr = (float(data["wins"]) / count) * 100.0
+        avg_r = data["r_sum"] / data["r_count"] if data["r_count"] else 0.0
+        avg_hold = data["avg_hold"] / data["hold_count"] if data["hold_count"] else 0.0
+        rows.append(
+            f"  {strategy}: n={count} WR={wr:.1f}% PnL={float(data['pnl']):+.4f}$ avgR={avg_r:+.2f} avgHold={avg_hold:.0f}m"
+        )
+    return "\n".join(rows)
 
 
 def should_use_llm_rank(candidates: list[dict], cfg: dict) -> tuple[bool, str]:
@@ -105,11 +151,20 @@ class Agent:
         self.open_trades: dict[str, Trade] = {}
         self._ret_cache: dict[str, list[float]] = {}
         self._ret_cache_ts = 0.0
+        self._rate_limit_hits = 0
+        self._rate_limit_backoff_until = 0.0
         self._load_local_state()
+        self._notify_if_restarted_after_gap()
         self._recover_from_exchange()
 
     def _save_trade(self, t: Trade):
         self.store.save_trade(t)
+
+    def _safe_save_trade(self, t: Trade):
+        try:
+            self._save_trade(t)
+        except Exception:
+            pass
 
     def _save_day_stats(self):
         self.store.save_day_stats(self.stats)
@@ -135,6 +190,11 @@ class Agent:
             return f"risk_usd=${float(self.cfg.get('risk_per_trade_usd', 0) or 0):.4f}"
         if mode == "fixed_notional_usd":
             return f"fixed_notional=${float(self.cfg.get('target_notional_usd', 0) or 0):.4f}"
+        if mode == "fixed_margin_usd":
+            return (
+                f"fixed_margin=${float(self.cfg.get('target_margin_usd', 0) or 0):.4f}"
+                f"@{int(self.cfg.get('target_leverage', 1) or 1)}x"
+            )
         return f"risk_pct={float(self.cfg.get('risk_per_trade_pct', 0) or 0):.4f}%"
 
     def _clear_critical_errors(self):
@@ -145,6 +205,112 @@ class Agent:
         self.stats.critical_errors = 0
         self.stats.halt_reason = ""
         self._save_day_stats()
+
+    def _notify_if_restarted_after_gap(self):
+        runtime = self.store.load_runtime_value("runtime_heartbeat") or {}
+        last_ts_raw = str(runtime.get("ts") or "").strip()
+        if not last_ts_raw:
+            return
+        try:
+            last_ts = datetime.fromisoformat(last_ts_raw)
+        except Exception:
+            return
+        gap_sec = max((datetime.now(timezone.utc) - last_ts).total_seconds(), 0.0)
+        warn_gap = max(int(self.cfg.get("cycle_sec", 900) or 900) * 2, 1800)
+        if gap_sec < warn_gap:
+            return
+        gap_min = gap_sec / 60.0
+        self.log.error(f"agent_restart_detected gap_min={gap_min:.1f} last_heartbeat={last_ts_raw}")
+        self.tg.send_error(
+            "agent_restart",
+            f"Агент был перезапущен или недоступен примерно {gap_min:.1f} мин. "
+            f"Последний heartbeat: {last_ts_raw}",
+        )
+
+    def _save_heartbeat(self):
+        self.store.save_runtime_value("runtime_heartbeat", {"ts": datetime.now(timezone.utc).isoformat()})
+
+    def _record_rate_limit_hit(self, symbol: str, ex: Exception):
+        now = time.time()
+        if now >= self._rate_limit_backoff_until:
+            self._rate_limit_hits = 0
+        self._rate_limit_hits += 1
+        self._rate_limit_backoff_until = now + max(int(self.cfg.get("cycle_sec", 900) or 900), 300)
+        self.log.warning(
+            f"rate_limit_backoff hits={self._rate_limit_hits} symbol={symbol} backoff_until={self._rate_limit_backoff_until:.0f}"
+        )
+        if self._rate_limit_hits == 1:
+            self.tg.send_error(
+                "rate_limit",
+                f"Bybit rate-limit при анализе {symbol}. Временно сужаю сканирование и снижаю нагрузку.",
+            )
+
+    def _effective_scan_limit(self) -> int:
+        base = max(int(self.cfg.get("max_scan_symbols", 20) or 20), 1)
+        if time.time() < self._rate_limit_backoff_until:
+            return max(5, base // 2)
+        return base
+
+    def _btc_filter(self, symbol: str, sig: dict, btc1h: dict | None, btc4h: dict | None) -> tuple[bool, str]:
+        if symbol == "BTCUSDT":
+            return True, ""
+        if not btc1h or not btc4h:
+            return True, ""
+        from signals import btc_context_filter
+
+        return btc_context_filter(symbol, sig, btc1h, btc4h)
+
+    def _finalize_trade_analytics(self, t: Trade, closed_info: dict | None = None):
+        if closed_info:
+            if closed_info.get("pnl_usd") is not None:
+                t.pnl_usd = float(closed_info.get("pnl_usd"))
+            exit_price = float(closed_info.get("exit_price", 0) or 0)
+            if exit_price > 0:
+                t.close_price = exit_price
+            fee = closed_info.get("total_fee_usd")
+            if fee is not None:
+                t.total_fee_usd = float(fee)
+        initial_risk = abs(float(t.entry or 0.0) - float(t.sl or 0.0))
+        if initial_risk > 0 and t.close_price:
+            if t.direction == "LONG":
+                realized_r = (float(t.close_price) - float(t.entry)) / initial_risk
+            else:
+                realized_r = (float(t.entry) - float(t.close_price)) / initial_risk
+            t.realized_r = round(float(realized_r), 4)
+        if t.open_time and t.close_time:
+            try:
+                open_dt = datetime.fromisoformat(t.open_time)
+                close_dt = datetime.fromisoformat(t.close_time)
+                t.hold_minutes = round(max((close_dt - open_dt).total_seconds(), 0.0) / 60.0, 2)
+            except Exception:
+                pass
+
+    def _closed_trade_info(self, symbol: str, open_time_ms: int) -> dict | None:
+        getter = getattr(self.ex, "closed_trade_info", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(symbol, open_time_ms)
+        except Exception:
+            return None
+        if initial_risk > 0 and t.open_time_ms:
+            try:
+                df = self.ex.klines(t.symbol, self.cfg["entry_tf"], limit=200)
+                open_ts = t.open_time_ms
+                close_dt = datetime.fromisoformat(t.close_time) if t.close_time else datetime.now(timezone.utc)
+                close_ts = int(close_dt.timestamp() * 1000)
+                window = df[(df["ts"].astype("int64") // 10**6 >= open_ts) & (df["ts"].astype("int64") // 10**6 <= close_ts)]
+                if not window.empty:
+                    high = float(window["high"].max())
+                    low = float(window["low"].min())
+                    if t.direction == "LONG":
+                        t.mfe_r = round((high - float(t.entry)) / initial_risk, 4)
+                        t.mae_r = round((float(t.entry) - low) / initial_risk, 4)
+                    else:
+                        t.mfe_r = round((float(t.entry) - low) / initial_risk, 4)
+                        t.mae_r = round((high - float(t.entry)) / initial_risk, 4)
+            except Exception:
+                pass
 
     def _record_critical_error(self, key: str, ex: Exception, symbol: str = ""):
         self.stats.critical_errors = int(getattr(self.stats, "critical_errors", 0) or 0) + 1
@@ -238,6 +404,7 @@ class Agent:
         losses = [t for t in self.stats.trades if (t.pnl_usd or 0) < 0]
         pnl = sum((t.pnl_usd or 0) for t in self.stats.trades)
         wr = len(wins) / len(self.stats.trades) * 100 if self.stats.trades else 0
+        strategy_rows = _strategy_rows(self.stats.trades)
         return (
             f"{title}\n"
             f"Дата: {self.stats.date} ({self.cfg.get('session_timezone', 'UTC')})\n"
@@ -247,7 +414,8 @@ class Agent:
             f"Закрыто: {len(self.stats.trades)}\n"
             f"Открытые позиции: {open_positions}\n"
             f"WIN: {len(wins)} LOSS: {len(losses)} WR: {wr:.1f}%\n"
-            f"Итог PnL: {pnl:+.4f}$"
+            f"Итог PnL: {pnl:+.4f}$\n"
+            + (f"Стратегии:\n{strategy_rows}" if strategy_rows else "")
         )
 
     def _set_stop_cooldown(self, symbol: str):
@@ -430,7 +598,10 @@ class Agent:
                     t.close_price = close_mark
                     t.close_time = datetime.now(timezone.utc).isoformat()
                     t.close_reason = reason
-                    t.pnl_usd = self.ex.realized_pnl_from_exchange(sym, t.open_time_ms)
+                    closed_info = self._closed_trade_info(sym, t.open_time_ms)
+                    t.pnl_usd = (closed_info or {}).get("pnl_usd", self.ex.realized_pnl_from_exchange(sym, t.open_time_ms))
+                    self._finalize_trade_analytics(t, closed_info)
+                    self._safe_save_trade(t)
                     self.stats.trades.append(t)
                     self._save_day_stats()
                     self._set_state(t, STATE_CLOSED, "close_all", {"reason": reason, "pnl": t.pnl_usd})
@@ -496,7 +667,12 @@ class Agent:
                 if t.state in ACTIVE_STATES:
                     t.close_time = datetime.now(timezone.utc).isoformat()
                     t.close_reason = "SL/TP/Manual"
-                    t.pnl_usd = self.ex.realized_pnl_from_exchange(sym, t.open_time_ms)
+                    closed_info = self._closed_trade_info(sym, t.open_time_ms)
+                    t.pnl_usd = (closed_info or {}).get("pnl_usd", self.ex.realized_pnl_from_exchange(sym, t.open_time_ms))
+                    if t.pnl_usd is None:
+                        self.log.warning(f"pnl_unresolved symbol={sym} open_time_ms={t.open_time_ms}")
+                    self._finalize_trade_analytics(t, closed_info)
+                    self._safe_save_trade(t)
                     self.stats.trades.append(t)
                     self._set_state(t, STATE_CLOSED, "sync_closed", {"pnl": t.pnl_usd})
                     self._set_state(t, STATE_RECONCILED, "sync_reconciled")
@@ -597,7 +773,14 @@ class Agent:
         if done >= self.cfg["max_trades_per_day"]:
             return
 
-        symbols = screen_coins(self.ex, self.cfg)
+        symbols = screen_coins(self.ex, self.cfg)[: self._effective_scan_limit()]
+        btc1h = None
+        btc4h = None
+        try:
+            btc1h = calc_indicators(self.ex.klines("BTCUSDT", self.cfg["regime_tf_1"]))
+            btc4h = calc_indicators(self.ex.klines("BTCUSDT", self.cfg["regime_tf_2"]))
+        except Exception as ex:
+            self.log.warning(f"btc_context_unavailable err={ex}")
         candidates = []
 
         for sym in symbols:
@@ -654,6 +837,26 @@ class Agent:
                             f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
                         )
                         continue
+                    ok_quality, quality_reason = signal_quality_filter(s, ind, self.cfg, oi.get("change_pct", 0))
+                    if not ok_quality:
+                        self.stats.skipped += 1
+                        self._save_day_stats()
+                        self._log_skip(
+                            sym,
+                            quality_reason,
+                            f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
+                        )
+                        continue
+                    ok_btc, btc_reason = self._btc_filter(sym, s, btc1h, btc4h)
+                    if not ok_btc:
+                        self.stats.skipped += 1
+                        self._save_day_stats()
+                        self._log_skip(
+                            sym,
+                            btc_reason,
+                            f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
+                        )
+                        continue
                     edge = edge_after_costs(s, self.cfg, fr)
                     min_edge_cost_ratio = float(self.cfg.get("min_edge_cost_ratio", 0) or 0)
                     min_net_reward_pct = float(self.cfg.get("min_net_reward_pct", 0) or 0)
@@ -685,8 +888,17 @@ class Agent:
                         )
                         continue
                     ok_regime, reg_reason = regime_filter(ind1h, ind4h, s["direction"], s["strategy"])
-                    score, reasons = score_signal(s, ind, fr, oi.get("change_pct", 0), ok_regime)
                     if not ok_regime:
+                        self.stats.skipped += 1
+                        self._save_day_stats()
+                        self._log_skip(
+                            sym,
+                            reg_reason or "regime_filter",
+                            f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
+                        )
+                        continue
+                    score, reasons = score_signal(s, ind, fr, oi.get("change_pct", 0), ok_regime)
+                    if reg_reason:
                         reasons.append(reg_reason)
                     if edge["edge_cost_ratio"] >= (min_edge_cost_ratio + 1.0):
                         reasons.append("edge_after_costs_strong")
@@ -719,6 +931,11 @@ class Agent:
             except Exception as ex:
                 self.log.error(f"analyze_failed symbol={sym} err={ex}")
                 self.tg.send_error("analysis", f"Анализ {sym}: {ex}")
+                if "10006" in str(ex) or "x-bapi-limit-reset-timestamp" in str(ex):
+                    self._record_rate_limit_hit(sym, ex)
+                    if self._rate_limit_hits >= 2:
+                        self.log.warning("scan_cycle_cut_short_due_rate_limit=true")
+                        break
 
         if not candidates:
             return
@@ -793,6 +1010,23 @@ class Agent:
                     continue
 
                 tp = round_to_step(float(s["tp"]), float(limits.get("tick_size", 0) or 0))
+                sl, tp = align_protective_prices(
+                    entry=float(sizing["entry"]),
+                    sl=float(sizing["sl"]),
+                    tp=float(tp),
+                    direction=direction,
+                    tick_size=float(limits.get("tick_size", 0) or 0),
+                )
+                post_align_rr = rr_ratio(float(sizing["entry"]), float(sl), float(tp), direction)
+                if post_align_rr < float(self.cfg.get("min_rr_ratio", 0) or 0):
+                    self.stats.skipped += 1
+                    self._save_day_stats()
+                    self._log_skip(
+                        sym,
+                        "rr_after_tick_align",
+                        f"rr={post_align_rr:.4f} min_rr_ratio={self.cfg.get('min_rr_ratio')}",
+                    )
+                    continue
                 now_iso = datetime.now(timezone.utc).isoformat()
                 now_ms = int(time.time() * 1000)
                 t = Trade(
@@ -801,7 +1035,7 @@ class Agent:
                     direction=direction,
                     strategy=s["strategy"],
                     entry=sizing["entry"],
-                    sl=sizing["sl"],
+                    sl=sl,
                     tp=tp,
                     size_usd=sizing["notional"],
                     confidence=100,
@@ -893,6 +1127,7 @@ class Agent:
             f"Sizing: {self._sizing_label()} | Max/day: {self.cfg['max_trades_per_day']}",
             force=True,
         )
+        self._save_heartbeat()
         while True:
             try:
                 await self.day_reset()
@@ -912,5 +1147,6 @@ class Agent:
                 self.log.error(f"cycle_failed err={ex}")
                 self.tg.send_error("cycle", f"Цикл: {ex}")
                 self._record_critical_error("cycle_failed", ex)
+            self._save_heartbeat()
             self.log.info(f"sleep_sec={self.cfg['cycle_sec']}")
             await asyncio.sleep(self.cfg["cycle_sec"])

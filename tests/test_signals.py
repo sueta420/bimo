@@ -1,4 +1,4 @@
-from signals import edge_after_costs, no_middle_range, regime_filter, score_signal
+from signals import btc_context_filter, edge_after_costs, no_middle_range, regime_filter, score_signal, screen_coins, signal_quality_filter
 
 
 def test_regime_filter_long_ok():
@@ -111,3 +111,60 @@ def test_edge_after_costs_detects_weak_trade():
     }
     edge = edge_after_costs(sig, cfg, funding=0.0001)
     assert edge["net_reward_per_unit"] < 0
+
+
+def test_signal_quality_filter_rejects_volatile_fakeout():
+    sig = {"entry": 100, "direction": "SHORT", "strategy": "fakeout"}
+    ind = {
+        "price": 100,
+        "support": 90,
+        "resistance": 100.5,
+        "atr": 1.6,
+        "vol_ratio": 120,
+    }
+    cfg = {
+        "fakeout_edge_max_frac": 0.12,
+        "fakeout_max_atr_ratio": 0.012,
+        "fakeout_max_oi_change_pct": 2.0,
+        "fakeout_min_vol_ratio": 90.0,
+    }
+    ok, reason = signal_quality_filter(sig, ind, cfg, oi_change_pct=0.5)
+    assert not ok
+    assert reason == "fakeout_too_volatile"
+
+
+def test_screen_coins_respects_blacklist_and_limit():
+    class Exchange:
+        def tickers(self):
+            return [
+                {"symbol": "BTCUSDT", "turnover24h": "100000000", "fundingRate": "0.0001"},
+                {"symbol": "FARTCOINUSDT", "turnover24h": "90000000", "fundingRate": "0.0001"},
+                {"symbol": "ETHUSDT", "turnover24h": "80000000", "fundingRate": "0.0001"},
+            ]
+
+    cfg = {
+        "min_volume_24h": 50_000_000,
+        "max_funding_abs": 0.001,
+        "max_scan_symbols": 2,
+        "symbol_blacklist": ["FARTCOINUSDT"],
+    }
+    out = screen_coins(Exchange(), cfg)
+    assert out == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_btc_context_filter_blocks_alt_countertrend():
+    sig = {"direction": "SHORT", "strategy": "fakeout"}
+    btc1h = {"price": 110, "ema20": 108, "ema50": 106, "ema200": 100, "atr": 1.0, "vol_ratio": 120}
+    btc4h = {"price": 130, "ema20": 125, "ema50": 120, "ema200": 110, "atr": 1.2, "vol_ratio": 130}
+    ok, reason = btc_context_filter("ETHUSDT", sig, btc1h, btc4h)
+    assert not ok
+    assert reason in {"btc_countertrend", "btc_fakeout_countertrend"}
+
+
+def test_btc_context_filter_allows_btc_itself():
+    sig = {"direction": "SHORT", "strategy": "fakeout"}
+    btc1h = {"price": 110, "ema20": 108, "ema50": 106, "ema200": 100, "atr": 1.0, "vol_ratio": 120}
+    btc4h = {"price": 130, "ema20": 125, "ema50": 120, "ema200": 110, "atr": 1.2, "vol_ratio": 130}
+    ok, reason = btc_context_filter("BTCUSDT", sig, btc1h, btc4h)
+    assert ok
+    assert reason == ""

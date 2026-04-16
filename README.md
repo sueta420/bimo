@@ -26,12 +26,15 @@
 ### Сигналы и фильтры
 - Rule-based сигналы: `breakout`, `fakeout`, `reversal`
 - Regime-фильтрация по `1h` и `4h`
+- BTC context filter для альтов
 - Входы на `15m`
 - Фильтр `min_rr_ratio`
 - Фильтр `no_middle_range`
 - Фильтр funding window
 - Блокировка по резкому всплеску `OI`
 - Фильтр “edge after costs”
+- Quality filter для `fakeout`
+- Поддержка `SYMBOL_BLACKLIST`
 - Score-модель с причинами `reasons`
 - Логирование `candidate`, `skip`, `candidate_pool`
 
@@ -61,6 +64,9 @@
 - Recovery после рестарта
 - Kill switch по критичным execution/reconciliation ошибкам
 - Session/day state сохраняется в SQLite
+- Heartbeat и alert при подозрении на простой/рестарт
+- Backoff при rate-limit Bybit
+- Singleton lock: защита от параллельного запуска двух копий агента
 
 ### Уведомления и отчеты
 - Уведомление о старте агента
@@ -69,6 +75,8 @@
 - Уведомление о полном закрытии
 - Уведомления об ошибках
 - Суточный отчет по торговому дню
+- Статы по стратегиям в суточном отчете
+- Post-trade analytics: `R`, `hold_minutes`, `MFE`, `MAE`, `fees`
 
 ## Структура проекта
 - `config.py` — чтение конфигурации из env
@@ -120,23 +128,173 @@
 - Фильтрует их по:
   - `MIN_VOLUME_24H`
   - `MAX_FUNDING_ABS`
+- Исключает тикеры из `SYMBOL_BLACKLIST`
 - Потом сортирует по `turnover24h`
-- И берет top-20
+- И берет top `MAX_SCAN_SYMBOLS`
+- При rate-limit временно сам сужает universe
 
 ### Размер позиции в текущем боевом профиле
 Сейчас боевой профиль настроен так:
-- `POSITION_SIZING_MODE=fixed_notional_usd`
-- `TARGET_NOTIONAL_USD=10`
-- `MAX_RISK_PER_TRADE_USD=1.0`
+- `POSITION_SIZING_MODE=fixed_margin_usd`
+- `TARGET_MARGIN_USD=10`
+- `TARGET_LEVERAGE=5`
+- `MAX_LEVERAGE=20`
+- `MAX_RISK_PER_TRADE_USD=1.5`
 - `MIN_RR_RATIO=3.0`
 - `MAX_TRADES_PER_DAY=5`
 - `STOP_AFTER_LOSSES=2`
 
 Это означает:
-- целевой вход около `10 USDT`;
+- агент целится использовать около `10 USDT` маржи на сделку;
+- при `5x` это дает примерно `50 USDT notional`;
 - сделки с заведомо плохим риском не проходят;
 - сделки с плохим `R:R` не проходят;
 - после серии убытков агент сам останавливает торговлю на день.
+
+## Все режимы sizing
+
+### `risk_pct`
+Размер позиции считается как процент от equity.
+
+Ключевые параметры:
+- `POSITION_SIZING_MODE=risk_pct`
+- `RISK_PER_TRADE_PCT`
+
+Когда использовать:
+- если нужен максимально классический риск-менеджмент;
+- если депозит уже достаточно большой;
+- если не хочется вручную контролировать размер notional/маржи.
+
+Плюсы:
+- риск автоматически масштабируется от баланса;
+- удобно для более “профессионального” money management.
+
+Минусы:
+- размер позиции может заметно плавать;
+- на маленьком депозите сделки часто получаются слишком маленькими.
+
+### `risk_usd`
+Размер позиции считается от фиксированного риска в долларах.
+
+Ключевые параметры:
+- `POSITION_SIZING_MODE=risk_usd`
+- `RISK_PER_TRADE_USD`
+
+Когда использовать:
+- если хочется строго контролировать убыток в долларах;
+- если баланс маленький, но нужен понятный денежный риск на сделку.
+
+Плюсы:
+- очень понятный контроль потерь;
+- удобно сравнивать сделки между собой.
+
+Минусы:
+- размер позиции сильно зависит от ширины стопа;
+- notional может получаться то маленьким, то слишком большим.
+
+### `fixed_notional_usd`
+Агент целится в фиксированный размер позиции.
+
+Ключевые параметры:
+- `POSITION_SIZING_MODE=fixed_notional_usd`
+- `TARGET_NOTIONAL_USD`
+- дополнительно можно ограничить через `MAX_RISK_PER_TRADE_USD`
+
+Когда использовать:
+- если нужен очень стабильный размер входа;
+- если хочется мягко протестировать торговлю на малом депозите.
+
+Плюсы:
+- очень предсказуемый размер сделки;
+- просто понимать загрузку капитала.
+
+Минусы:
+- реальный риск по сделке будет плавать вместе со стопом;
+- без `MAX_RISK_PER_TRADE_USD` можно поймать неудобные сетапы.
+
+### `fixed_margin_usd`
+Агент целится в фиксированную маржу на сделку и использует целевое плечо.
+
+Ключевые параметры:
+- `POSITION_SIZING_MODE=fixed_margin_usd`
+- `TARGET_MARGIN_USD`
+- `TARGET_LEVERAGE`
+- `MAX_LEVERAGE`
+- `MAX_RISK_PER_TRADE_USD`
+
+Когда использовать:
+- если нужен более “фьючерсный” режим;
+- если хочется контролировать именно используемую маржу, а не только notional;
+- если нужен более активный профиль на небольшом депозите.
+
+Плюсы:
+- удобно управлять загрузкой депозита;
+- можно задать понятную комбинацию `маржа + плечо`.
+
+Минусы:
+- при слишком большом плече стоп придется делать слишком тесным;
+- без risk-cap такой режим легко становится агрессивным.
+
+## Как выбирать режим
+
+### Если депозит маленький и нужен мягкий старт
+- `fixed_notional_usd`
+- `TARGET_NOTIONAL_USD=10`
+- `MAX_RISK_PER_TRADE_USD=1.0`
+
+### Если хочется активнее использовать капитал, но без безумия
+- `fixed_margin_usd`
+- `TARGET_MARGIN_USD=10`
+- `TARGET_LEVERAGE=5`
+- `MAX_RISK_PER_TRADE_USD=1.0-1.5`
+
+### Если нужен строгий контроль потерь
+- `risk_usd`
+- `RISK_PER_TRADE_USD=1.0-1.5`
+
+### Если депозит вырастет и нужен более “портфельный” режим
+- `risk_pct`
+- `RISK_PER_TRADE_PCT=0.5-1.0`
+
+## Как выбирать плечо
+
+### `1x`
+- самый спокойный режим;
+- подходит для `fixed_notional_usd`;
+- на маленьком депозите часто слишком вялый.
+
+### `3x-5x`
+- лучший рабочий диапазон для старта на маленьком депозите;
+- позволяет использовать капитал заметно активнее;
+- стопы еще не становятся слишком тесными.
+
+### `8x-10x`
+- уже агрессивнее;
+- требует более точных входов и более чистых инструментов;
+- для альтов может стать слишком чувствительным к рыночному шуму.
+
+### `20x`
+- только как верхний лимит, а не как базовый режим;
+- при том же risk-cap требует очень тесного стопа;
+- для большинства альтов и мемов обычно слишком агрессивно.
+
+## Практика по риску
+
+### Что делает `MAX_RISK_PER_TRADE_USD`
+Это верхний потолок потерь на сделку.
+Если структура сделки требует большего риска, сигнал будет пропущен.
+
+### Что сейчас стоит в бою
+- `MAX_RISK_PER_TRADE_USD=1.5`
+
+Это примерно:
+- около `2.6%` от депозита `58 USDT`
+- при `R:R = 1:3` целевой reward около `4.5 USDT`
+
+### Что обычно разумно
+- `1.0 USDT` — спокойный старт
+- `1.2-1.5 USDT` — бодро, но терпимо
+- `2.0 USDT+` — уже агрессивно для малого депозита
 
 ## Полная инструкция по настройке
 
@@ -166,11 +324,23 @@ cp .env.example .env
 ### 5. Ключевые настройки
 - `TESTNET`
 - `POSITION_SIZING_MODE`
+- `RISK_PER_TRADE_PCT`
+- `RISK_PER_TRADE_USD`
 - `TARGET_NOTIONAL_USD`
+- `TARGET_MARGIN_USD`
+- `TARGET_LEVERAGE`
+- `MAX_LEVERAGE`
 - `MAX_RISK_PER_TRADE_USD`
 - `MIN_RR_RATIO`
 - `MIN_EDGE_COST_RATIO`
 - `MIN_NET_REWARD_PCT`
+- `MIN_RULE_SCORE`
+- `MAX_SCAN_SYMBOLS`
+- `SYMBOL_BLACKLIST`
+- `FAKEOUT_EDGE_MAX_FRAC`
+- `FAKEOUT_MAX_ATR_RATIO`
+- `FAKEOUT_MAX_OI_CHANGE_PCT`
+- `FAKEOUT_MIN_VOL_RATIO`
 - `MAX_TRADES_PER_DAY`
 - `STOP_AFTER_LOSSES`
 - `SESSION_TIMEZONE`
@@ -180,17 +350,40 @@ cp .env.example .env
 ### 6. Рекомендуемый боевой профиль для малого депозита
 ```env
 TESTNET=false
-POSITION_SIZING_MODE=fixed_notional_usd
-TARGET_NOTIONAL_USD=10
-MAX_RISK_PER_TRADE_USD=1.0
+POSITION_SIZING_MODE=fixed_margin_usd
+TARGET_MARGIN_USD=10
+TARGET_LEVERAGE=5
+MAX_LEVERAGE=20
+MAX_RISK_PER_TRADE_USD=1.5
 MIN_RR_RATIO=3.0
 MIN_EDGE_COST_RATIO=2.0
 MIN_NET_REWARD_PCT=0.25
+MIN_RULE_SCORE=70
+MAX_SCAN_SYMBOLS=20
+SYMBOL_BLACKLIST=FARTCOINUSDT,1000PEPEUSDT,RAVEUSDT
+FAKEOUT_EDGE_MAX_FRAC=0.12
+FAKEOUT_MAX_ATR_RATIO=0.012
+FAKEOUT_MAX_OI_CHANGE_PCT=2.0
+FAKEOUT_MIN_VOL_RATIO=90
 MAX_TRADES_PER_DAY=5
 STOP_AFTER_LOSSES=2
 SESSION_TIMEZONE=Europe/Moscow
 ENABLE_EOD_CLOSE=false
 ```
+
+### 7. Более спокойный профиль
+```env
+POSITION_SIZING_MODE=fixed_notional_usd
+TARGET_NOTIONAL_USD=10
+MAX_RISK_PER_TRADE_USD=1.0
+MIN_RR_RATIO=3.0
+```
+
+### 8. Что не стоит делать сразу
+- не ставить `20x` как базовое рабочее плечо;
+- не поднимать `MAX_RISK_PER_TRADE_USD` слишком резко;
+- не отключать risk-cap ради “больших движений”;
+- не торговать шумные low-cap без blacklist или whitelist.
 
 ## Как запускать
 
@@ -252,7 +445,17 @@ tail -n 100 /Users/bot/trading/agent_stderr.log
 - частичное закрытие;
 - закрытие позиции с `PnL`;
 - критичные ошибки;
+- alert о простое/рестарте после заметного gap;
 - суточный отчет.
+
+## Что смотреть по качеству торговли
+- `realized_r` — сколько фактически принесла сделка в единицах риска
+- `hold_minutes` — сколько позиция жила
+- `mfe_r` — максимальное благоприятное движение в `R`
+- `mae_r` — максимальное неблагоприятное движение в `R`
+- `total_fee_usd` — суммарные комиссии по сделке, если биржа их вернула
+
+Эти поля сохраняются в SQLite и используются в суточном отчете.
 
 Важно:
 - торговый агент шлет уведомления напрямую через `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`;

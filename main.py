@@ -1,4 +1,6 @@
 import asyncio
+import atexit
+import fcntl
 import json
 import logging
 import os
@@ -8,6 +10,9 @@ from zoneinfo import ZoneInfo
 
 from config import CONFIG
 from execution import Agent
+
+
+_LOCK_FH = None
 
 
 def resolve_session_tz(name: str):
@@ -57,8 +62,33 @@ def init_logging(cfg):
     return logging.getLogger("agent")
 
 
+def acquire_singleton_lock(cfg, log) -> None:
+    global _LOCK_FH
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent.lock")
+    fh = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error("another_agent_instance_detected=true")
+        print("Another agent instance is already running. Exiting.")
+        sys.exit(1)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _LOCK_FH = fh
+
+    def _cleanup():
+        try:
+            if _LOCK_FH:
+                _LOCK_FH.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+
+
 def main():
     log = init_logging(CONFIG)
+    acquire_singleton_lock(CONFIG, log)
     missing = [k for k in ("api_key", "api_secret") if not CONFIG.get(k)]
     if missing:
         mapping = {"api_key": "BYBIT_API_KEY", "api_secret": "BYBIT_API_SECRET"}

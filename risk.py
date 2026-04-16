@@ -15,6 +15,8 @@ def normalize_sizing_mode(mode: str) -> str:
         return "risk_usd"
     if m in ("fixed_notional_usd", "fixed_notional", "notional_usd"):
         return "fixed_notional_usd"
+    if m in ("fixed_margin_usd", "margin_usd", "fixed_margin"):
+        return "fixed_margin_usd"
     return "risk_pct"
 
 
@@ -62,6 +64,32 @@ def round_to_step(value: float, step: float) -> float:
     return float(q * s)
 
 
+def align_protective_prices(entry: float, sl: float, tp: float, direction: str, tick_size: float) -> tuple[float, float]:
+    entry_px = float(entry or 0.0)
+    sl_px = float(sl or 0.0)
+    tp_px = float(tp or 0.0)
+    tick = float(tick_size or 0.0)
+    if tick <= 0:
+        return sl_px, tp_px
+
+    if direction == "LONG":
+        sl_adj = floor_to_step(sl_px, tick)
+        tp_adj = ceil_to_step(tp_px, tick)
+        if sl_adj >= entry_px:
+            sl_adj = floor_to_step(entry_px - tick, tick)
+        if tp_adj <= entry_px:
+            tp_adj = ceil_to_step(entry_px + tick, tick)
+    else:
+        sl_adj = ceil_to_step(sl_px, tick)
+        tp_adj = floor_to_step(tp_px, tick)
+        if sl_adj <= entry_px:
+            sl_adj = ceil_to_step(entry_px + tick, tick)
+        if tp_adj >= entry_px:
+            tp_adj = floor_to_step(entry_px - tick, tick)
+
+    return float(sl_adj), float(tp_adj)
+
+
 def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
     equity = float(wallet.get("equity", 0) or 0)
     available = float(wallet.get("available", 0) or 0)
@@ -82,6 +110,14 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
         target_notional_usd = float(cfg.get("target_notional_usd", 0) or 0)
         if target_notional_usd <= 0:
             return None, "target_notional_usd<=0"
+    elif mode == "fixed_margin_usd":
+        target_margin_usd = float(cfg.get("target_margin_usd", 0) or 0)
+        target_leverage = int(cfg.get("target_leverage", 1) or 1)
+        if target_margin_usd <= 0:
+            return None, "target_margin_usd<=0"
+        if target_leverage <= 0:
+            return None, "target_leverage<=0"
+        target_notional_usd = target_margin_usd * target_leverage
 
     slip_in = float(cfg["slippage_entry_bps"]) / 10_000.0
     slip_out = float(cfg["slippage_exit_bps"]) / 10_000.0
@@ -113,7 +149,7 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
 
     entry_adj = round_to_step(entry_px, tick_size)
     sl_adj = round_to_step(sl_px, tick_size)
-    if mode == "fixed_notional_usd":
+    if mode in {"fixed_notional_usd", "fixed_margin_usd"}:
         if entry_adj <= 0:
             return None, "entry<=0"
         qty_raw = target_notional_usd / entry_adj
@@ -142,10 +178,13 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
     max_risk_cap = float(cfg.get("max_risk_per_trade_usd", 0) or 0)
     if max_risk_cap > 0 and effective_risk > max_risk_cap:
         return None, f"risk_cap_exceeded {effective_risk:.4f}>{max_risk_cap:.4f}"
-    if mode != "fixed_notional_usd" and effective_risk > risk_budget_usd * 1.02:
+    if mode not in {"fixed_notional_usd", "fixed_margin_usd"} and effective_risk > risk_budget_usd * 1.02:
         return None, f"effective_risk>{risk_budget_usd:.4f}"
 
-    req_lev = max(1, math.ceil(notional / available))
+    if mode == "fixed_margin_usd":
+        req_lev = max(1, int(cfg.get("target_leverage", 1) or 1))
+    else:
+        req_lev = max(1, math.ceil(notional / available))
     if req_lev > int(cfg["max_leverage"]):
         return None, f"required_leverage>{cfg['max_leverage']}"
 

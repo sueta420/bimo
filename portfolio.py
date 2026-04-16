@@ -46,6 +46,11 @@ class Trade:
     open_time_ms: int = 0
     score: int = 0
     notes: str = ""
+    realized_r: Optional[float] = None
+    hold_minutes: Optional[float] = None
+    mfe_r: Optional[float] = None
+    mae_r: Optional[float] = None
+    total_fee_usd: Optional[float] = None
 
 
 @dataclass
@@ -108,6 +113,11 @@ class StateStore:
                 open_time_ms INTEGER NOT NULL DEFAULT 0,
                 score INTEGER NOT NULL DEFAULT 0,
                 notes TEXT NOT NULL DEFAULT '',
+                realized_r REAL,
+                hold_minutes REAL,
+                mfe_r REAL,
+                mae_r REAL,
+                total_fee_usd REAL,
                 payload_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -144,6 +154,17 @@ class StateStore:
             )
             """
         )
+        for col, col_type in (
+            ("realized_r", "REAL"),
+            ("hold_minutes", "REAL"),
+            ("mfe_r", "REAL"),
+            ("mae_r", "REAL"),
+            ("total_fee_usd", "REAL"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
 
     def save_trade(self, trade: Trade):
@@ -156,10 +177,11 @@ class StateStore:
                 id, symbol, state, direction, strategy, entry, sl, tp, size_usd, confidence,
                 open_time, close_time, close_price, pnl_usd, close_reason, order_id,
                 qty, filled_qty, risk_usd, open_time_ms, score, notes, payload_json, updated_at
+                , realized_r, hold_minutes, mfe_r, mae_r, total_fee_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET
                 symbol=excluded.symbol,
@@ -183,6 +205,11 @@ class StateStore:
                 open_time_ms=excluded.open_time_ms,
                 score=excluded.score,
                 notes=excluded.notes,
+                realized_r=excluded.realized_r,
+                hold_minutes=excluded.hold_minutes,
+                mfe_r=excluded.mfe_r,
+                mae_r=excluded.mae_r,
+                total_fee_usd=excluded.total_fee_usd,
                 payload_json=excluded.payload_json,
                 updated_at=excluded.updated_at
             """,
@@ -190,7 +217,7 @@ class StateStore:
                 trade.id, trade.symbol, trade.state, trade.direction, trade.strategy, trade.entry, trade.sl, trade.tp,
                 trade.size_usd, trade.confidence, trade.open_time, trade.close_time, trade.close_price, trade.pnl_usd,
                 trade.close_reason, trade.order_id, trade.qty, trade.filled_qty, trade.risk_usd, trade.open_time_ms,
-                trade.score, trade.notes, payload, now,
+                trade.score, trade.notes, payload, now, trade.realized_r, trade.hold_minutes, trade.mfe_r, trade.mae_r, trade.total_fee_usd,
             ),
         )
         self.conn.commit()
@@ -282,5 +309,29 @@ class StateStore:
             trades = [Trade(**item) for item in payload.get("trades", [])]
             payload["trades"] = trades
             return DayStats(**payload)
+        except Exception:
+            return None
+
+    def save_runtime_value(self, key: str, payload: dict):
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO session_state (key, payload_json, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at
+            """,
+            (key, json.dumps(payload, ensure_ascii=False), now),
+        )
+        self.conn.commit()
+
+    def load_runtime_value(self, key: str) -> Optional[dict]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT payload_json FROM session_state WHERE key=?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+            return payload if isinstance(payload, dict) else None
         except Exception:
             return None

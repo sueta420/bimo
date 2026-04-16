@@ -20,6 +20,7 @@ agent_state*.sqlite3
 startup.log
 agent_stdout.log
 agent_stderr.log
+.agent.lock
 *.swp
 *.swo
 *.bak

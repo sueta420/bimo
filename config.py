@@ -64,6 +64,14 @@ def env_str(name: str, default: str) -> str:
     return v if v else default
 
 
+def env_csv(name: str, default: list[str] | None = None) -> list[str]:
+    raw = os.getenv(name, "")
+    if raw is None:
+        return list(default or [])
+    items = [x.strip().upper() for x in str(raw).split(",")]
+    return [x for x in items if x] or list(default or [])
+
+
 def build_config() -> dict[str, Any]:
     load_dotenv_file(os.path.join(BASE_DIR, ".env"))
     return {
@@ -81,6 +89,8 @@ def build_config() -> dict[str, Any]:
         "risk_per_trade_pct": env_float("RISK_PER_TRADE_PCT", 0.5),
         "risk_per_trade_usd": env_float("RISK_PER_TRADE_USD", 0.0),
         "target_notional_usd": env_float("TARGET_NOTIONAL_USD", 5.0),
+        "target_margin_usd": env_float("TARGET_MARGIN_USD", 0.0),
+        "target_leverage": env_int("TARGET_LEVERAGE", 1),
         "max_risk_per_trade_usd": env_float("MAX_RISK_PER_TRADE_USD", 0.0),
         "min_rr_ratio": env_float("MIN_RR_RATIO", 3.0),
         "min_edge_cost_ratio": env_float("MIN_EDGE_COST_RATIO", 2.0),
@@ -94,8 +104,14 @@ def build_config() -> dict[str, Any]:
         "max_leverage": env_int("MAX_LEVERAGE", 10),
         "stop_after_losses": env_int("STOP_AFTER_LOSSES", 3),
         "min_volume_24h": env_float("MIN_VOLUME_24H", 50_000_000),
+        "max_scan_symbols": env_int("MAX_SCAN_SYMBOLS", 20),
+        "symbol_blacklist": env_csv("SYMBOL_BLACKLIST", []),
         "max_funding_abs": env_float("MAX_FUNDING_ABS", 0.001),
         "min_atr_ratio": env_float("MIN_ATR_RATIO", 0.005),
+        "fakeout_edge_max_frac": env_float("FAKEOUT_EDGE_MAX_FRAC", 0.12),
+        "fakeout_max_atr_ratio": env_float("FAKEOUT_MAX_ATR_RATIO", 0.012),
+        "fakeout_max_oi_change_pct": env_float("FAKEOUT_MAX_OI_CHANGE_PCT", 2.0),
+        "fakeout_min_vol_ratio": env_float("FAKEOUT_MIN_VOL_RATIO", 90.0),
         "signal_tf": os.getenv("SIGNAL_TF", "15"),
         "entry_tf": os.getenv("ENTRY_TF", "15"),
         "regime_tf_1": os.getenv("REGIME_TF_1", "60"),

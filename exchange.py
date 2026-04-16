@@ -21,6 +21,60 @@ def sum_realized_pnl(rows: list[dict], pnl_field: str, ts_field: str, open_time_
     return round(total, 6) if got else None
 
 
+def latest_realized_pnl(rows: list[dict], pnl_field: str, ts_fields: list[str], open_time_ms: int = 0) -> Optional[float]:
+    latest_ts = -1
+    latest_val = None
+    for row in rows:
+        try:
+            ts = 0
+            for field in ts_fields:
+                ts = int(row.get(field, 0) or 0)
+                if ts:
+                    break
+            if open_time_ms and ts and ts < open_time_ms:
+                continue
+            val = float(row.get(pnl_field, 0) or 0)
+            if ts >= latest_ts:
+                latest_ts = ts
+                latest_val = val
+        except Exception:
+            continue
+    return round(latest_val, 6) if latest_val is not None else None
+
+
+def latest_closed_trade_info(rows: list[dict], open_time_ms: int = 0) -> Optional[dict]:
+    latest_ts = -1
+    latest_row = None
+    for row in rows:
+        try:
+            created_ts = int(row.get("createdTime", 0) or 0)
+            updated_ts = int(row.get("updatedTime", 0) or 0)
+            ts = created_ts or updated_ts
+            if open_time_ms and ts and ts < open_time_ms:
+                continue
+            if ts >= latest_ts:
+                latest_ts = ts
+                latest_row = row
+        except Exception:
+            continue
+    if not latest_row:
+        return None
+    try:
+        return {
+            "pnl_usd": round(float(latest_row.get("closedPnl", 0) or 0), 6),
+            "exit_price": float(latest_row.get("avgExitPrice", 0) or 0),
+            "total_fee_usd": round(
+                float(latest_row.get("openFee", 0) or 0) + float(latest_row.get("closeFee", 0) or 0),
+                6,
+            ),
+            "closed_size": float(latest_row.get("closedSize", latest_row.get("qty", 0)) or 0),
+            "created_time_ms": int(latest_row.get("createdTime", 0) or 0),
+            "updated_time_ms": int(latest_row.get("updatedTime", 0) or 0),
+        }
+    except Exception:
+        return None
+
+
 def _d(value) -> Decimal:
     return Decimal(str(value))
 
@@ -300,6 +354,23 @@ class BybitClient:
 
     def realized_pnl_from_exchange(self, symbol, open_time_ms: int = 0):
         try:
+            params = {"category": "linear", "symbol": symbol, "limit": 100}
+            if open_time_ms > 0:
+                params["startTime"] = int(open_time_ms)
+            r = self.s.get_closed_pnl(**params)
+            rows = r.get("result", {}).get("list", [])
+            v = latest_realized_pnl(
+                rows,
+                pnl_field="closedPnl",
+                ts_fields=["createdTime", "updatedTime"],
+                open_time_ms=open_time_ms,
+            )
+            if v is not None:
+                return v
+        except Exception:
+            pass
+
+        try:
             r = self.s.get_executions(category="linear", symbol=symbol, limit=200)
             rows = r.get("result", {}).get("list", [])
             v = sum_realized_pnl(rows, pnl_field="execPnl", ts_field="execTime", open_time_ms=open_time_ms)
@@ -309,9 +380,31 @@ class BybitClient:
             pass
 
         try:
-            r = self.s.get_closed_pnl(category="linear", symbol=symbol, limit=50)
+            params = {"category": "linear", "symbol": symbol, "limit": 100}
+            if open_time_ms > 0:
+                params["startTime"] = int(open_time_ms)
+            r = self.s.get_closed_pnl(**params)
             rows = r.get("result", {}).get("list", [])
-            return sum_realized_pnl(rows, pnl_field="closedPnl", ts_field="updatedTime", open_time_ms=open_time_ms)
+            v = sum_realized_pnl(rows, pnl_field="closedPnl", ts_field="updatedTime", open_time_ms=open_time_ms)
+            if v is not None:
+                return v
+            return latest_realized_pnl(
+                rows,
+                pnl_field="closedPnl",
+                ts_fields=["updatedTime", "createdTime"],
+                open_time_ms=open_time_ms,
+            )
+        except Exception:
+            return None
+
+    def closed_trade_info(self, symbol: str, open_time_ms: int = 0) -> Optional[dict]:
+        try:
+            params = {"category": "linear", "symbol": symbol, "limit": 100}
+            if open_time_ms > 0:
+                params["startTime"] = int(open_time_ms)
+            r = self.s.get_closed_pnl(**params)
+            rows = r.get("result", {}).get("list", [])
+            return latest_closed_trade_info(rows, open_time_ms=open_time_ms)
         except Exception:
             return None
 
