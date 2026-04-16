@@ -77,6 +77,8 @@
 - Суточный отчет по торговому дню
 - Статы по стратегиям в суточном отчете
 - Post-trade analytics: `R`, `hold_minutes`, `MFE`, `MAE`, `fees`
+- `trade_review` по закрытым сделкам
+- `skip analytics summary` по причинам отказа
 
 ## Структура проекта
 - `config.py` — чтение конфигурации из env
@@ -235,6 +237,24 @@
 - при слишком большом плече стоп придется делать слишком тесным;
 - без risk-cap такой режим легко становится агрессивным.
 
+### Динамическое плечо
+В режиме `fixed_margin_usd` можно включить динамическое плечо:
+- `DYNAMIC_LEVERAGE_ENABLED=true`
+
+Тогда агент берет базовое плечо из стратегии:
+- `FAKEOUT_TARGET_LEVERAGE`
+- `BREAKOUT_TARGET_LEVERAGE`
+- `REVERSAL_TARGET_LEVERAGE`
+
+И потом корректирует его:
+- вверх при высоком `score`
+- вниз при высоком `ATR`
+
+Это позволяет:
+- не давать одинаковое плечо всем сетапам подряд;
+- быть осторожнее на шумном рынке;
+- чуть агрессивнее использовать действительно сильные сигналы.
+
 ## Как выбирать режим
 
 ### Если депозит маленький и нужен мягкий старт
@@ -267,6 +287,7 @@
 - лучший рабочий диапазон для старта на маленьком депозите;
 - позволяет использовать капитал заметно активнее;
 - стопы еще не становятся слишком тесными.
+- в текущем боевом профиле это основной рабочий диапазон
 
 ### `8x-10x`
 - уже агрессивнее;
@@ -354,6 +375,16 @@ POSITION_SIZING_MODE=fixed_margin_usd
 TARGET_MARGIN_USD=10
 TARGET_LEVERAGE=5
 MAX_LEVERAGE=20
+DYNAMIC_LEVERAGE_ENABLED=true
+FAKEOUT_TARGET_LEVERAGE=4
+BREAKOUT_TARGET_LEVERAGE=5
+REVERSAL_TARGET_LEVERAGE=3
+DYNAMIC_LEVERAGE_HIGH_SCORE=80
+DYNAMIC_LEVERAGE_LOW_SCORE=72
+DYNAMIC_LEVERAGE_HIGH_SCORE_BONUS=1
+DYNAMIC_LEVERAGE_LOW_SCORE_CUT=1
+DYNAMIC_LEVERAGE_HIGH_ATR_RATIO=0.012
+DYNAMIC_LEVERAGE_HIGH_ATR_CUT=1
 MAX_RISK_PER_TRADE_USD=1.5
 MIN_RR_RATIO=3.0
 MIN_EDGE_COST_RATIO=2.0
@@ -384,6 +415,14 @@ MIN_RR_RATIO=3.0
 - не поднимать `MAX_RISK_PER_TRADE_USD` слишком резко;
 - не отключать risk-cap ради “больших движений”;
 - не торговать шумные low-cap без blacklist или whitelist.
+
+### Как сейчас выбирается плечо в бою
+- `fakeout` базово: `4x`
+- `breakout` базово: `5x`
+- `reversal` базово: `3x`
+- сильный `score` может дать небольшой бонус
+- высокий `ATR` может уменьшить плечо
+- итог все равно ограничен `MAX_LEVERAGE` и `MAX_RISK_PER_TRADE_USD`
 
 ## Как запускать
 
@@ -454,8 +493,20 @@ tail -n 100 /Users/bot/trading/agent_stderr.log
 - `mfe_r` — максимальное благоприятное движение в `R`
 - `mae_r` — максимальное неблагоприятное движение в `R`
 - `total_fee_usd` — суммарные комиссии по сделке, если биржа их вернула
+- `review_text` — короткий разбор закрытой сделки
+- `review_tags` — быстрые флаги вроде `full_stop`, `gave_back_edge`, `strong_winner`
 
 Эти поля сохраняются в SQLite и используются в суточном отчете.
+
+## Skip Analytics
+Агент теперь агрегирует причины `skip` в течение дня.
+
+Что это дает:
+- видно, какие фильтры чаще всего режут рынок;
+- можно понять, агент слишком строгий или слишком мягкий;
+- проще калибровать `regime`, `fakeout` и `risk`-пороги.
+
+В отчетах и summary это показывается как `Skip summary`.
 
 Важно:
 - торговый агент шлет уведомления напрямую через `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`;

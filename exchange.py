@@ -321,6 +321,17 @@ class BybitClient:
                 out.append(p)
         return out
 
+    def position_protection(self, pos: dict) -> dict:
+        try:
+            sl = float(pos.get("stopLoss", 0) or 0)
+        except Exception:
+            sl = 0.0
+        try:
+            tp = float(pos.get("takeProfit", 0) or 0)
+        except Exception:
+            tp = 0.0
+        return {"sl": sl, "tp": tp}
+
     def wallet_snapshot(self):
         r = self.s.get_wallet_balance(accountType="UNIFIED")
         lst = r.get("result", {}).get("list", [])

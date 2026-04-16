@@ -1,3 +1,4 @@
+from execution import make_report
 from portfolio import DayStats, StateStore, Trade
 
 
@@ -27,6 +28,7 @@ def test_day_stats_roundtrip(tmp_path):
         stopped=True,
         critical_errors=2,
         halt_reason="sync_trade_failed: boom",
+        skip_reasons={"regime_filter": 2, "min_rr_ratio": 1},
     )
 
     store.save_day_stats(stats)
@@ -41,6 +43,16 @@ def test_day_stats_roundtrip(tmp_path):
     assert loaded.stopped is True
     assert loaded.critical_errors == 2
     assert loaded.halt_reason == "sync_trade_failed: boom"
+    assert loaded.skip_reasons == {"regime_filter": 2, "min_rr_ratio": 1}
     assert len(loaded.trades) == 1
     assert loaded.trades[0].symbol == "BTCUSDT"
     assert loaded.trades[0].pnl_usd == 4.25
+
+
+def test_make_report_writes_into_explicit_reports_dir(tmp_path):
+    stats = DayStats(date="2026-04-16")
+    report, path = make_report(stats, max_trades_per_day=5, session_timezone="Europe/Moscow", reports_dir=str(tmp_path))
+
+    assert "ОТЧЁТ 2026-04-16" in report
+    assert path == str(tmp_path / "report_20260416.txt")
+    assert (tmp_path / "report_20260416.txt").exists()

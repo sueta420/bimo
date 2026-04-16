@@ -20,6 +20,29 @@ def normalize_sizing_mode(mode: str) -> str:
     return "risk_pct"
 
 
+def resolve_target_leverage(cfg: dict, strategy: str = "", score: int = 0, atr_ratio: float = 0.0) -> int:
+    base = int(cfg.get("target_leverage", 1) or 1)
+    if cfg.get("dynamic_leverage_enabled"):
+        strategy_key = str(strategy or "").strip().lower()
+        if strategy_key == "fakeout":
+            base = int(cfg.get("fakeout_target_leverage", base) or base)
+        elif strategy_key == "breakout":
+            base = int(cfg.get("breakout_target_leverage", base) or base)
+        elif strategy_key == "reversal":
+            base = int(cfg.get("reversal_target_leverage", base) or base)
+
+        if int(score or 0) >= int(cfg.get("dynamic_leverage_high_score", 80) or 80):
+            base += int(cfg.get("dynamic_leverage_high_score_bonus", 1) or 0)
+        elif int(score or 0) <= int(cfg.get("dynamic_leverage_low_score", 72) or 72):
+            base -= int(cfg.get("dynamic_leverage_low_score_cut", 1) or 0)
+
+        if float(atr_ratio or 0.0) >= float(cfg.get("dynamic_leverage_high_atr_ratio", 0.012) or 0.012):
+            base -= int(cfg.get("dynamic_leverage_high_atr_cut", 1) or 0)
+
+    max_leverage = int(cfg.get("max_leverage", 1) or 1)
+    return max(1, min(base, max_leverage))
+
+
 def rr_ratio(entry: float, sl: float, tp: float, direction: str) -> float:
     entry_px = float(entry or 0.0)
     sl_px = float(sl or 0.0)
@@ -90,7 +113,7 @@ def align_protective_prices(entry: float, sl: float, tp: float, direction: str, 
     return float(sl_adj), float(tp_adj)
 
 
-def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
+def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits, strategy: str = "", score: int = 0, atr_ratio: float = 0.0):
     equity = float(wallet.get("equity", 0) or 0)
     available = float(wallet.get("available", 0) or 0)
     if equity <= 0:
@@ -112,7 +135,7 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
             return None, "target_notional_usd<=0"
     elif mode == "fixed_margin_usd":
         target_margin_usd = float(cfg.get("target_margin_usd", 0) or 0)
-        target_leverage = int(cfg.get("target_leverage", 1) or 1)
+        target_leverage = resolve_target_leverage(cfg, strategy=strategy, score=score, atr_ratio=atr_ratio)
         if target_margin_usd <= 0:
             return None, "target_margin_usd<=0"
         if target_leverage <= 0:
@@ -197,6 +220,7 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits):
         "notional": round(notional, 6),
         "entry": entry_adj,
         "sl": sl_adj,
+        "target_leverage": int(resolve_target_leverage(cfg, strategy=strategy, score=score, atr_ratio=atr_ratio)) if mode == "fixed_margin_usd" else int(req_lev),
     }, ""
 
 

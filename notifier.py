@@ -143,3 +143,14 @@ class LLMExplainer:
             return sorted(items, key=lambda x: rank.get(x.get("sym"), 10_000))
         except Exception:
             return items
+
+    def review_trade(self, context: dict) -> str:
+        if not self.enabled:
+            return ""
+        prompt = (
+            "Сделай очень краткий post-trade review на русском языке. "
+            "1 короткое предложение: что подтвердилось или что было слабым в сделке. "
+            "Не выдумывай данные. Контекст сделки:\n"
+            f"{json.dumps(context, ensure_ascii=False)}"
+        )
+        return self._ask(prompt, max_tokens=120)

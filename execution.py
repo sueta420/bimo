@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -42,7 +43,12 @@ from signals import (
 )
 
 
-def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str = "UTC") -> tuple[str, str]:
+def make_report(
+    stats: DayStats,
+    max_trades_per_day: int,
+    session_timezone: str = "UTC",
+    reports_dir: str | None = None,
+) -> tuple[str, str]:
     wins = [t for t in stats.trades if (t.pnl_usd or 0) > 0]
     losses = [t for t in stats.trades if (t.pnl_usd or 0) < 0]
     pnl = sum((t.pnl_usd or 0) for t in stats.trades)
@@ -50,6 +56,7 @@ def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str 
     closed = len(stats.trades)
     lines = []
     strategy_rows = _strategy_rows(stats.trades)
+    skip_rows = _skip_rows(stats.skip_reasons)
     for i, t in enumerate(stats.trades, 1):
         icon = "WIN" if (t.pnl_usd or 0) > 0 else ("LOSS" if (t.pnl_usd or 0) < 0 else "BE")
         lines.append(
@@ -57,6 +64,7 @@ def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str 
             f"PnL:{(t.pnl_usd or 0):+.4f}$ R:{(t.realized_r if t.realized_r is not None else 0):+.2f} "
             f"Hold:{(t.hold_minutes if t.hold_minutes is not None else 0):.0f}m "
             f"score:{t.score} {t.close_reason}"
+            + (f" | review: {t.review_text}" if t.review_text else "")
         )
     report = (
         f"\n{'=' * 52}\n  ОТЧЁТ {stats.date} ({session_timezone})\n{'=' * 52}\n"
@@ -66,10 +74,14 @@ def make_report(stats: DayStats, max_trades_per_day: int, session_timezone: str 
     )
     if strategy_rows:
         report += f"{'─' * 52}\n{strategy_rows}\n"
+    if skip_rows:
+        report += f"{'─' * 52}\nSkip summary:\n{skip_rows}\n"
     report += f"{'─' * 52}\n"
     report += "\n".join(lines) if lines else "  Сделок не было"
     report += f"\n{'=' * 52}\n"
-    path = f"report_{stats.date.replace('-', '')}.txt"
+    base_dir = os.path.abspath(reports_dir or os.getcwd())
+    os.makedirs(base_dir, exist_ok=True)
+    path = os.path.join(base_dir, f"report_{stats.date.replace('-', '')}.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(report)
     return report, path
@@ -109,6 +121,13 @@ def _strategy_rows(trades: list[Trade]) -> str:
             f"  {strategy}: n={count} WR={wr:.1f}% PnL={float(data['pnl']):+.4f}$ avgR={avg_r:+.2f} avgHold={avg_hold:.0f}m"
         )
     return "\n".join(rows)
+
+
+def _skip_rows(skip_reasons: dict[str, int]) -> str:
+    if not skip_reasons:
+        return ""
+    ordered = sorted(skip_reasons.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+    return "\n".join(f"  {reason}: {count}" for reason, count in ordered[:8])
 
 
 def should_use_llm_rank(candidates: list[dict], cfg: dict) -> tuple[bool, str]:
@@ -153,6 +172,7 @@ class Agent:
         self._ret_cache_ts = 0.0
         self._rate_limit_hits = 0
         self._rate_limit_backoff_until = 0.0
+        self._cycle_seq = 0
         self._load_local_state()
         self._notify_if_restarted_after_gap()
         self._recover_from_exchange()
@@ -227,6 +247,14 @@ class Agent:
             f"Последний heartbeat: {last_ts_raw}",
         )
 
+    def _enter_safe_mode(self, reason: str, symbol: str = ""):
+        self.stats.stopped = True
+        self.stats.halt_reason = reason
+        self._save_day_stats()
+        suffix = f" symbol={symbol}" if symbol else ""
+        self.log.error(f"safe_mode_entered reason={reason}{suffix}")
+        self.tg.send_error("safe_mode", f"Агент переведен в safe mode: {reason}" + (f" ({symbol})" if symbol else ""))
+
     def _save_heartbeat(self):
         self.store.save_runtime_value("runtime_heartbeat", {"ts": datetime.now(timezone.utc).isoformat()})
 
@@ -284,15 +312,7 @@ class Agent:
                 t.hold_minutes = round(max((close_dt - open_dt).total_seconds(), 0.0) / 60.0, 2)
             except Exception:
                 pass
-
-    def _closed_trade_info(self, symbol: str, open_time_ms: int) -> dict | None:
-        getter = getattr(self.ex, "closed_trade_info", None)
-        if not callable(getter):
-            return None
-        try:
-            return getter(symbol, open_time_ms)
-        except Exception:
-            return None
+        initial_risk = abs(float(t.entry or 0.0) - float(t.sl or 0.0))
         if initial_risk > 0 and t.open_time_ms:
             try:
                 df = self.ex.klines(t.symbol, self.cfg["entry_tf"], limit=200)
@@ -311,6 +331,60 @@ class Agent:
                         t.mae_r = round((high - float(t.entry)) / initial_risk, 4)
             except Exception:
                 pass
+
+        tags = []
+        if t.realized_r is not None:
+            if t.realized_r >= 2.0:
+                tags.append("strong_winner")
+            elif t.realized_r <= -1.0:
+                tags.append("full_stop")
+        if t.mfe_r is not None and t.realized_r is not None and t.mfe_r >= 2.0 and t.realized_r < 0.5:
+            tags.append("gave_back_edge")
+        if t.mae_r is not None and t.mae_r > 1.0:
+            tags.append("deep_adverse_move")
+        if t.hold_minutes is not None and t.hold_minutes < 30:
+            tags.append("fast_resolution")
+        t.review_tags = ",".join(tags)
+
+        review_parts = []
+        if t.realized_r is not None:
+            if t.realized_r >= 1.0:
+                review_parts.append("Сделка реализовала импульс в нашу сторону.")
+            elif t.realized_r <= -0.8:
+                review_parts.append("Идея быстро не подтвердилась и рынок пошел против входа.")
+            else:
+                review_parts.append("Сделка не раскрыла сильного преимущества после входа.")
+        if t.mfe_r is not None and t.realized_r is not None and t.mfe_r >= 2.0 and t.realized_r < 0.5:
+            review_parts.append("Часть потенциального движения была отдана обратно.")
+        base_review = " ".join(review_parts[:2]).strip()
+        llm_obj = getattr(self, "llm", None)
+        llm_review = ""
+        if llm_obj and hasattr(llm_obj, "review_trade"):
+            llm_review = llm_obj.review_trade(
+                {
+                    "symbol": t.symbol,
+                    "strategy": t.strategy,
+                    "direction": t.direction,
+                    "pnl_usd": t.pnl_usd,
+                    "realized_r": t.realized_r,
+                    "mfe_r": t.mfe_r,
+                    "mae_r": t.mae_r,
+                    "hold_minutes": t.hold_minutes,
+                    "close_reason": t.close_reason,
+                    "score": t.score,
+                    "notes": t.notes,
+                }
+            )
+        t.review_text = llm_review or base_review
+
+    def _closed_trade_info(self, symbol: str, open_time_ms: int) -> dict | None:
+        getter = getattr(self.ex, "closed_trade_info", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(symbol, open_time_ms)
+        except Exception:
+            return None
 
     def _record_critical_error(self, key: str, ex: Exception, symbol: str = ""):
         self.stats.critical_errors = int(getattr(self.stats, "critical_errors", 0) or 0) + 1
@@ -376,14 +450,17 @@ class Agent:
             direction = "LONG" if side == "Buy" else "SHORT"
             avg_price = float(pos.get("avgPrice", 0) or 0)
             qty = float(pos.get("size", 0) or 0)
+            protection = self.ex.position_protection(pos)
+            recovered_sl = float(protection.get("sl", 0) or 0)
+            recovered_tp = float(protection.get("tp", 0) or 0)
             t = Trade(
                 id=f"REC_{sym}_{int(time.time())}",
                 symbol=sym,
                 direction=direction,
                 strategy="recovered",
                 entry=avg_price,
-                sl=0.0,
-                tp=0.0,
+                sl=recovered_sl,
+                tp=recovered_tp,
                 size_usd=avg_price * qty,
                 confidence=0,
                 open_time=now_iso,
@@ -397,7 +474,11 @@ class Agent:
             self.open_trades[sym] = t
             self._save_trade(t)
             self.store.add_event(t.id, t.symbol, "", STATE_OPEN, "startup_found_exchange_position", {})
-            self.log.warning(f"recovery_external_position symbol={sym}")
+            self.log.warning(
+                f"recovery_external_position symbol={sym} sl={recovered_sl:.6f} tp={recovered_tp:.6f}"
+            )
+            if recovered_sl <= 0 or recovered_tp <= 0:
+                self._enter_safe_mode("recovered_position_without_full_protection", sym)
 
     def day_summary_text(self, title, open_positions):
         wins = [t for t in self.stats.trades if (t.pnl_usd or 0) > 0]
@@ -405,6 +486,7 @@ class Agent:
         pnl = sum((t.pnl_usd or 0) for t in self.stats.trades)
         wr = len(wins) / len(self.stats.trades) * 100 if self.stats.trades else 0
         strategy_rows = _strategy_rows(self.stats.trades)
+        skip_rows = _skip_rows(self.stats.skip_reasons)
         return (
             f"{title}\n"
             f"Дата: {self.stats.date} ({self.cfg.get('session_timezone', 'UTC')})\n"
@@ -415,7 +497,8 @@ class Agent:
             f"Открытые позиции: {open_positions}\n"
             f"WIN: {len(wins)} LOSS: {len(losses)} WR: {wr:.1f}%\n"
             f"Итог PnL: {pnl:+.4f}$\n"
-            + (f"Стратегии:\n{strategy_rows}" if strategy_rows else "")
+            + (f"Стратегии:\n{strategy_rows}\n" if strategy_rows else "")
+            + (f"Skip summary:\n{skip_rows}" if skip_rows else "")
         )
 
     def _set_stop_cooldown(self, symbol: str):
@@ -433,6 +516,7 @@ class Agent:
                 self.stats,
                 self.cfg["max_trades_per_day"],
                 self.cfg.get("session_timezone", "UTC"),
+                self.cfg.get("reports_dir"),
             )
             self.log.info(f"report_path={path}")
             print(report)
@@ -727,6 +811,9 @@ class Agent:
         return ranked + tail
 
     def _log_skip(self, symbol: str, reason: str, extra: str = ""):
+        key = str(reason or "unknown_skip")
+        self.stats.skip_reasons[key] = int(self.stats.skip_reasons.get(key, 0) or 0) + 1
+        self._save_day_stats()
         suffix = f" {extra}" if extra else ""
         self.log.info(f"skip symbol={symbol} reason={reason}{suffix}")
 
@@ -748,32 +835,67 @@ class Agent:
         )
         self.log.info(f"candidate_pool count={len(candidates)} top={preview}")
 
+    def _log_cycle_summary(self, label: str, started_skipped: int, candidates_count: int = 0, summary: dict | None = None):
+        skipped_delta = int(self.stats.skipped) - int(started_skipped)
+        extra = ""
+        if summary:
+            extra = (
+                f" status={label}"
+                f" scanned={int(summary.get('scanned', 0))}"
+                f" no_signal={int(summary.get('no_signal', 0))}"
+                f" skips={int(summary.get('skips', 0))}"
+                f" candidates={int(candidates_count)}"
+                f" opened={int(summary.get('opened', 0))}"
+                f" errors={int(summary.get('errors', 0))}"
+            )
+        self.log.info(
+            f"cycle_id={self._cycle_seq} summary open_trades={len(self.open_trades)} closed_trades={len(self.stats.trades)} "
+            f"signals_total={self.stats.signals_total} skipped_delta={skipped_delta}{extra}"
+        )
+
     async def cycle(self):
+        self._cycle_seq += 1
+        cycle_started_skipped = int(self.stats.skipped)
+        cycle_summary = {"scanned": 0, "no_signal": 0, "skips": 0, "opened": 0, "errors": 0}
+        self.log.info(
+            f"cycle_id={self._cycle_seq} cycle_start open_trades={len(self.open_trades)} closed_trades={len(self.stats.trades)} "
+            f"signals_total={self.stats.signals_total} stopped={self.stats.stopped}"
+        )
         now = datetime.now(timezone.utc)
         if (
             self.cfg.get("enable_eod_close", True)
             and now.hour == self.cfg["close_hour_utc"]
             and now.minute >= self.cfg["close_min_utc"]
         ):
+            self.log.info(f"cycle_id={self._cycle_seq} cycle_stage=eod_close")
             await self.close_all("eod_close")
             return
 
+        self.log.info(f"cycle_id={self._cycle_seq} cycle_stage=sync_trades")
         await self.sync_trades()
         if self.stats.stopped:
+            self.log.warning(f"cycle_id={self._cycle_seq} why_not_trading=stats_stopped halt_reason={self.stats.halt_reason}")
             self.log.warning(f"trading_stopped_for_day=true halt_reason={self.stats.halt_reason}")
             return
         if self.stats.consecutive_losses >= self.cfg["stop_after_losses"]:
             self.stats.stopped = True
             self.stats.halt_reason = "stop_after_losses"
             self._save_day_stats()
+            self.log.warning(f"cycle_id={self._cycle_seq} why_not_trading=stop_after_losses consecutive_losses={self.stats.consecutive_losses}")
             self.log.warning("stop_after_losses_triggered=true")
             return
 
         done = len(self.stats.trades) + len(self.open_trades)
         if done >= self.cfg["max_trades_per_day"]:
+            self.log.info(f"cycle_id={self._cycle_seq} why_not_trading=max_trades_per_day done={done} limit={self.cfg['max_trades_per_day']}")
+            self.log.info(f"cycle_blocked=max_trades_per_day done={done} limit={self.cfg['max_trades_per_day']}")
             return
 
         symbols = screen_coins(self.ex, self.cfg)[: self._effective_scan_limit()]
+        self.log.info(
+            f"cycle_id={self._cycle_seq} cycle_stage=scan_universe symbols={len(symbols)} max_scan_symbols={self.cfg.get('max_scan_symbols', 20)} "
+            f"effective_limit={self._effective_scan_limit()}"
+        )
         btc1h = None
         btc4h = None
         try:
@@ -783,17 +905,29 @@ class Agent:
             self.log.warning(f"btc_context_unavailable err={ex}")
         candidates = []
 
-        for sym in symbols:
+        for idx, sym in enumerate(symbols, 1):
+            cycle_summary["scanned"] += 1
+            self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_start symbol={sym} progress={idx}/{len(symbols)}")
             if sym in self.open_trades:
+                self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_skip symbol={sym} reason=already_open")
+                cycle_summary["skips"] += 1
                 continue
             if self._in_symbol_cooldown(sym):
                 self.stats.skipped += 1
                 self._save_day_stats()
+                self._log_skip(sym, "symbol_cooldown")
+                cycle_summary["skips"] += 1
                 continue
             try:
                 df = self.ex.klines(sym, self.cfg["entry_tf"])
                 ind = calc_indicators(df)
                 if not ind.get("atr") or ind["atr"] / ind["price"] < self.cfg["min_atr_ratio"]:
+                    self.log.info(
+                        f"cycle_id={self._cycle_seq} analyze_symbol_skip symbol={sym} reason=min_atr_ratio "
+                        f"atr_ratio={(float(ind.get('atr') or 0.0) / max(float(ind.get('price') or 1.0), 1e-9)):.4f} "
+                        f"min_atr_ratio={self.cfg['min_atr_ratio']}"
+                    )
+                    cycle_summary["skips"] += 1
                     continue
 
                 fmeta = self.ex.funding_meta(sym)
@@ -801,12 +935,14 @@ class Agent:
                 if in_funding_block(fmeta.get("next_funding_ms", 0), self.cfg["funding_block_minutes"]):
                     self.stats.skipped += 1
                     self._save_day_stats()
+                    cycle_summary["skips"] += 1
                     continue
 
                 oi = self.ex.open_interest(sym)
                 if oi_spike_block(oi.get("change_pct", 0), self.cfg["oi_spike_block_pct"]):
                     self.stats.skipped += 1
                     self._save_day_stats()
+                    cycle_summary["skips"] += 1
                     continue
 
                 ind1h = calc_indicators(self.ex.klines(sym, self.cfg["regime_tf_1"]))
@@ -815,6 +951,12 @@ class Agent:
                 sigs = detect_signals(ind, fr)
                 self.stats.signals_total += len(sigs)
                 self._save_day_stats()
+                self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_signals symbol={sym} signals={len(sigs)}")
+                if not sigs:
+                    self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_done symbol={sym} status=no_signal")
+                    cycle_summary["no_signal"] += 1
+                    await asyncio.sleep(0.12)
+                    continue
                 for s in sigs:
                     signal_rr = rr_ratio(float(s["entry"]), float(s["sl"]), float(s["tp"]), s["direction"])
                     if signal_rr < float(self.cfg.get("min_rr_ratio", 0) or 0):
@@ -826,6 +968,7 @@ class Agent:
                             f"rr={signal_rr:.4f} min_rr_ratio={self.cfg.get('min_rr_ratio')} "
                             f"strategy={s['strategy']} direction={s['direction']}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     ok_mid, mid_reason = no_middle_range(s, ind, self.cfg["range_mid_avoid_pct"])
                     if not ok_mid:
@@ -836,6 +979,7 @@ class Agent:
                             mid_reason,
                             f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     ok_quality, quality_reason = signal_quality_filter(s, ind, self.cfg, oi.get("change_pct", 0))
                     if not ok_quality:
@@ -846,6 +990,7 @@ class Agent:
                             quality_reason,
                             f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     ok_btc, btc_reason = self._btc_filter(sym, s, btc1h, btc4h)
                     if not ok_btc:
@@ -856,6 +1001,7 @@ class Agent:
                             btc_reason,
                             f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     edge = edge_after_costs(s, self.cfg, fr)
                     min_edge_cost_ratio = float(self.cfg.get("min_edge_cost_ratio", 0) or 0)
@@ -868,6 +1014,7 @@ class Agent:
                             "net_edge<=0",
                             f"net_reward={edge['net_reward_per_unit']:.6f} cost={edge['cost_per_unit']:.6f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     if min_edge_cost_ratio > 0 and edge["edge_cost_ratio"] < min_edge_cost_ratio:
                         self.stats.skipped += 1
@@ -877,6 +1024,7 @@ class Agent:
                             "edge_cost_ratio",
                             f"ratio={edge['edge_cost_ratio']:.4f} min={min_edge_cost_ratio:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     if min_net_reward_pct > 0 and edge["net_reward_pct"] < min_net_reward_pct:
                         self.stats.skipped += 1
@@ -886,6 +1034,7 @@ class Agent:
                             "net_reward_pct",
                             f"net_reward_pct={edge['net_reward_pct']:.4f} min={min_net_reward_pct:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     ok_regime, reg_reason = regime_filter(ind1h, ind4h, s["direction"], s["strategy"])
                     if not ok_regime:
@@ -896,6 +1045,7 @@ class Agent:
                             reg_reason or "regime_filter",
                             f"strategy={s['strategy']} direction={s['direction']} rr={signal_rr:.4f}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     score, reasons = score_signal(s, ind, fr, oi.get("change_pct", 0), ok_regime)
                     if reg_reason:
@@ -913,6 +1063,7 @@ class Agent:
                             f"score={score} min_rule_score={self.cfg['min_rule_score']} "
                             f"rr={signal_rr:.4f} reasons={summarize_reasons(reasons, limit=5)}",
                         )
+                        cycle_summary["skips"] += 1
                         continue
                     item = {
                         "sym": sym,
@@ -927,10 +1078,12 @@ class Agent:
                     }
                     candidates.append(item)
                     self._log_candidate(item)
+                self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_done symbol={sym} status=ok candidates_total={len(candidates)}")
                 await asyncio.sleep(0.12)
             except Exception as ex:
                 self.log.error(f"analyze_failed symbol={sym} err={ex}")
                 self.tg.send_error("analysis", f"Анализ {sym}: {ex}")
+                cycle_summary["errors"] += 1
                 if "10006" in str(ex) or "x-bapi-limit-reset-timestamp" in str(ex):
                     self._record_rate_limit_hit(sym, ex)
                     if self._rate_limit_hits >= 2:
@@ -938,6 +1091,7 @@ class Agent:
                         break
 
         if not candidates:
+            self._log_cycle_summary("cycle_end_no_candidates", cycle_started_skipped, 0, cycle_summary)
             return
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -966,11 +1120,15 @@ class Agent:
                     item["fr"],
                     wallet,
                     limits,
+                    strategy=s["strategy"],
+                    score=item["score"],
+                    atr_ratio=(float(item["ind"].get("atr", 0.0) or 0.0) / max(float(item["ind"].get("price", 1.0) or 1.0), 1e-9)),
                 )
                 if not sizing:
                     self.stats.skipped += 1
                     self._save_day_stats()
                     self._log_skip(sym, reject_reason, f"score={item['score']} rr={item.get('rr', 0.0):.4f}")
+                    cycle_summary["skips"] += 1
                     continue
                 item["sizing"] = sizing
 
@@ -989,6 +1147,7 @@ class Agent:
                         side_reason,
                         f"risk_usd={float(sizing['risk_usd']):.4f} direction={direction}",
                     )
+                    cycle_summary["skips"] += 1
                     continue
 
                 return_series = {sym: self._symbol_returns(sym)}
@@ -1007,6 +1166,7 @@ class Agent:
                     self.stats.skipped += 1
                     self._save_day_stats()
                     self._log_skip(sym, corr_reason, f"direction={direction} score={item['score']}")
+                    cycle_summary["skips"] += 1
                     continue
 
                 tp = round_to_step(float(s["tp"]), float(limits.get("tick_size", 0) or 0))
@@ -1026,6 +1186,7 @@ class Agent:
                         "rr_after_tick_align",
                         f"rr={post_align_rr:.4f} min_rr_ratio={self.cfg.get('min_rr_ratio')}",
                     )
+                    cycle_summary["skips"] += 1
                     continue
                 now_iso = datetime.now(timezone.utc).isoformat()
                 now_ms = int(time.time() * 1000)
@@ -1087,6 +1248,7 @@ class Agent:
 
                 self.stats.opened += 1
                 self._save_day_stats()
+                cycle_summary["opened"] += 1
                 explain = self.llm.explain(
                     context={
                         "symbol": sym,
@@ -1102,6 +1264,8 @@ class Agent:
                 )
                 self.log.info(
                     f"opened symbol={sym} direction={direction} qty={t.qty} lev={sizing['leverage']} "
+                    f"target_lev={sizing.get('target_leverage', sizing['leverage'])} "
+                    f"strategy={t.strategy} atr_ratio={(float(item['ind'].get('atr', 0.0) or 0.0) / max(float(item['ind'].get('price', 1.0) or 1.0), 1e-9)):.4f} "
                     f"risk={sizing['risk_usd']:.4f} score={item['score']} rr={item.get('rr', 0.0):.3f} "
                     f"reasons={summarize_reasons(item['reasons'], limit=4)}"
                 )
@@ -1118,6 +1282,8 @@ class Agent:
                 bad = self.open_trades.pop(sym, None)
                 if bad:
                     self._set_state(bad, STATE_RECONCILED, "order_send_failed", {"error": str(ex)})
+                cycle_summary["errors"] += 1
+        self._log_cycle_summary("cycle_end", cycle_started_skipped, len(candidates), cycle_summary)
 
     async def run(self):
         mode = "TESTNET" if self.cfg["testnet"] else "*** REAL MONEY ***"
@@ -1139,6 +1305,7 @@ class Agent:
                     self.stats,
                     self.cfg["max_trades_per_day"],
                     self.cfg.get("session_timezone", "UTC"),
+                    self.cfg.get("reports_dir"),
                 )
                 print(report)
                 self.tg.send(self.day_summary_text("Агент остановлен. Итог дня", open_before_close), force=True)

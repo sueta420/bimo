@@ -51,6 +51,8 @@ class Trade:
     mfe_r: Optional[float] = None
     mae_r: Optional[float] = None
     total_fee_usd: Optional[float] = None
+    review_text: str = ""
+    review_tags: str = ""
 
 
 @dataclass
@@ -64,6 +66,7 @@ class DayStats:
     stopped: bool = False
     critical_errors: int = 0
     halt_reason: str = ""
+    skip_reasons: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,6 +121,8 @@ class StateStore:
                 mfe_r REAL,
                 mae_r REAL,
                 total_fee_usd REAL,
+                review_text TEXT NOT NULL DEFAULT '',
+                review_tags TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -160,6 +165,8 @@ class StateStore:
             ("mfe_r", "REAL"),
             ("mae_r", "REAL"),
             ("total_fee_usd", "REAL"),
+            ("review_text", "TEXT"),
+            ("review_tags", "TEXT"),
         ):
             try:
                 cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
@@ -177,11 +184,11 @@ class StateStore:
                 id, symbol, state, direction, strategy, entry, sl, tp, size_usd, confidence,
                 open_time, close_time, close_price, pnl_usd, close_reason, order_id,
                 qty, filled_qty, risk_usd, open_time_ms, score, notes, payload_json, updated_at
-                , realized_r, hold_minutes, mfe_r, mae_r, total_fee_usd
+                , realized_r, hold_minutes, mfe_r, mae_r, total_fee_usd, review_text, review_tags
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET
                 symbol=excluded.symbol,
@@ -210,6 +217,8 @@ class StateStore:
                 mfe_r=excluded.mfe_r,
                 mae_r=excluded.mae_r,
                 total_fee_usd=excluded.total_fee_usd,
+                review_text=excluded.review_text,
+                review_tags=excluded.review_tags,
                 payload_json=excluded.payload_json,
                 updated_at=excluded.updated_at
             """,
@@ -218,6 +227,7 @@ class StateStore:
                 trade.size_usd, trade.confidence, trade.open_time, trade.close_time, trade.close_price, trade.pnl_usd,
                 trade.close_reason, trade.order_id, trade.qty, trade.filled_qty, trade.risk_usd, trade.open_time_ms,
                 trade.score, trade.notes, payload, now, trade.realized_r, trade.hold_minutes, trade.mfe_r, trade.mae_r, trade.total_fee_usd,
+                trade.review_text, trade.review_tags,
             ),
         )
         self.conn.commit()

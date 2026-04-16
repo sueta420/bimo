@@ -288,3 +288,67 @@ def test_sync_trades_marks_partial_close_and_scales_risk_once():
     assert trade.risk_usd == 5.0
     assert len(sent_messages) == sent_before
     assert state_before == state_changes
+
+
+def test_recover_external_position_enters_safe_mode_without_full_protection():
+    agent = Agent.__new__(Agent)
+    agent.log = logging.getLogger("test-agent")
+    agent.open_trades = {}
+    agent.stats = type(
+        "Stats",
+        (),
+        {
+            "trades": [],
+            "stopped": False,
+            "halt_reason": "",
+        },
+    )()
+    saved_trades = []
+    runtime_events = []
+    safe_modes = []
+    agent._save_trade = lambda trade: saved_trades.append(trade)
+    agent._save_day_stats = lambda: None
+    agent.store = type(
+        "Store",
+        (),
+        {"add_event": lambda self, trade_id, symbol, from_state, to_state, reason, payload=None: runtime_events.append((symbol, reason))},
+    )()
+    agent.tg = type("Notifier", (), {"send_error": lambda self, key, text: None})()
+    agent._enter_safe_mode = lambda reason, symbol="": (
+        setattr(agent.stats, "stopped", True),
+        setattr(agent.stats, "halt_reason", reason),
+        safe_modes.append((reason, symbol)),
+    )
+
+    class Exchange:
+        def list_positions(self):
+            return [{"symbol": "BTCUSDT", "side": "Buy", "avgPrice": "100000", "size": "0.01"}]
+
+        def position_protection(self, pos):
+            return {"sl": 0.0, "tp": 0.0}
+
+    agent.ex = Exchange()
+
+    agent._recover_from_exchange()
+
+    assert "BTCUSDT" in agent.open_trades
+    assert saved_trades[0].sl == 0.0
+    assert saved_trades[0].tp == 0.0
+    assert safe_modes == [("recovered_position_without_full_protection", "BTCUSDT")]
+    assert agent.stats.stopped is True
+    assert runtime_events == [("BTCUSDT", "startup_found_exchange_position")]
+
+
+def test_log_skip_tracks_reason_counts():
+    agent = Agent.__new__(Agent)
+    agent.log = logging.getLogger("test-agent")
+    saved = []
+    agent.stats = type("Stats", (), {"skip_reasons": {}})()
+    agent._save_day_stats = lambda: saved.append(dict(agent.stats.skip_reasons))
+
+    agent._log_skip("BTCUSDT", "regime_filter", "x")
+    agent._log_skip("ETHUSDT", "regime_filter", "y")
+    agent._log_skip("SOLUSDT", "min_rr_ratio", "z")
+
+    assert agent.stats.skip_reasons == {"regime_filter": 2, "min_rr_ratio": 1}
+    assert saved[-1] == {"regime_filter": 2, "min_rr_ratio": 1}

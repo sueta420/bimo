@@ -1,5 +1,5 @@
 from portfolio import STATE_OPEN, Trade
-from risk import align_protective_prices, check_side_exposure, correlation_allowed, floor_to_step, rr_ratio, size_position
+from risk import align_protective_prices, check_side_exposure, correlation_allowed, floor_to_step, resolve_target_leverage, rr_ratio, size_position
 
 
 def test_size_position_equity_based():
@@ -167,6 +167,26 @@ def test_size_position_with_fixed_margin_mode():
     assert res["notional"] >= 49.9
     assert res["notional"] <= 50.1
     assert res["leverage"] == 5
+
+
+def test_resolve_target_leverage_dynamic_policy():
+    cfg = {
+        "target_leverage": 5,
+        "max_leverage": 20,
+        "dynamic_leverage_enabled": True,
+        "fakeout_target_leverage": 4,
+        "breakout_target_leverage": 5,
+        "reversal_target_leverage": 3,
+        "dynamic_leverage_high_score": 80,
+        "dynamic_leverage_low_score": 72,
+        "dynamic_leverage_high_score_bonus": 1,
+        "dynamic_leverage_low_score_cut": 1,
+        "dynamic_leverage_high_atr_ratio": 0.012,
+        "dynamic_leverage_high_atr_cut": 1,
+    }
+    assert resolve_target_leverage(cfg, strategy="fakeout", score=68, atr_ratio=0.008) == 3
+    assert resolve_target_leverage(cfg, strategy="breakout", score=82, atr_ratio=0.008) == 6
+    assert resolve_target_leverage(cfg, strategy="reversal", score=75, atr_ratio=0.02) == 2
 
 
 def test_rr_ratio_long_and_short():
