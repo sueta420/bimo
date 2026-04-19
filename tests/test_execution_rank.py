@@ -1,4 +1,5 @@
-from execution import should_use_llm_rank, summarize_reasons
+from execution import planned_exit_metrics, should_use_llm_rank, summarize_reasons
+from portfolio import Trade
 
 
 def test_summarize_reasons_limits_output():
@@ -43,3 +44,29 @@ def test_should_use_llm_rank_skips_low_scores():
     ok, reason = should_use_llm_rank(candidates, cfg)
     assert not ok
     assert reason == "top_score_below_min"
+
+
+def test_planned_exit_metrics_long_stop_slippage():
+    trade = Trade(
+        id="t1",
+        symbol="ADAUSDT",
+        direction="LONG",
+        strategy="range_bounce",
+        entry=0.2523,
+        sl=0.2509,
+        tp=0.2560,
+        size_usd=59.0,
+        confidence=80,
+        open_time="2026-04-18T10:57:29+00:00",
+        close_time="2026-04-18T11:51:01+00:00",
+        close_price=0.2506,
+        pnl_usd=-0.52,
+        qty=237.0,
+        filled_qty=237.0,
+    )
+    metrics = planned_exit_metrics(trade)
+    assert metrics["planned_kind"] == "SL"
+    assert round(metrics["planned_price"], 4) == 0.2509
+    assert round(metrics["actual_price"], 4) == 0.2506
+    assert round(metrics["slippage_price"], 4) == -0.0003
+    assert round(metrics["slippage_pnl_usd"], 4) == -0.0711

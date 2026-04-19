@@ -1,4 +1,17 @@
-from signals import btc_context_filter, edge_after_costs, no_middle_range, regime_filter, score_signal, screen_coins, signal_quality_filter
+import pandas as pd
+
+from signals import (
+    btc_context_filter,
+    calc_indicators,
+    detect_signals,
+    edge_after_costs,
+    no_middle_range,
+    regime_filter,
+    regime_strategy_allowlist,
+    score_signal,
+    screen_coins,
+    signal_quality_filter,
+)
 
 
 def test_regime_filter_long_ok():
@@ -39,6 +52,14 @@ def test_regime_filter_reversal_blocks_against_expansion():
     ok, reason = regime_filter(ind1h, ind4h, "LONG", "reversal")
     assert not ok
     assert reason == "regime_reversal_vs_expansion"
+
+
+def test_regime_filter_range_bounce_allows_same_side_trend_without_expansion():
+    ind1h = {"price": 110, "ema20": 108, "ema50": 105, "ema200": 100, "atr": 0.7, "vol_ratio": 120}
+    ind4h = {"price": 130, "ema20": 125, "ema50": 120, "ema200": 110, "atr": 0.9, "vol_ratio": 125}
+    ok, reason = regime_filter(ind1h, ind4h, "LONG", "range_bounce")
+    assert ok
+    assert reason == ""
 
 
 def test_no_middle_range_breakout_long():
@@ -168,3 +189,69 @@ def test_btc_context_filter_allows_btc_itself():
     ok, reason = btc_context_filter("BTCUSDT", sig, btc1h, btc4h)
     assert ok
     assert reason == ""
+
+
+def test_calc_indicators_handles_short_history_without_crashing():
+    df = pd.DataFrame(
+        {
+            "ts": pd.date_range("2026-04-17", periods=6, freq="15min"),
+            "open": [1, 1.1, 1.2, 1.15, 1.18, 1.2],
+            "high": [1.1, 1.2, 1.25, 1.2, 1.22, 1.24],
+            "low": [0.98, 1.05, 1.1, 1.1, 1.15, 1.18],
+            "close": [1.05, 1.15, 1.18, 1.16, 1.2, 1.22],
+            "volume": [100, 120, 130, 125, 140, 150],
+            "turnover": [0, 0, 0, 0, 0, 0],
+        }
+    )
+    ind = calc_indicators(df)
+    assert ind["price"] == 1.22
+    assert ind["support"] == 0.98
+    assert ind["resistance"] == 1.25
+    assert ind["atr"] is not None
+
+
+def test_regime_strategy_allowlist_prefers_trend_setups_in_trend():
+    ind1h = {"price": 110, "ema20": 108, "ema50": 105, "ema200": 100, "atr": 1.0, "vol_ratio": 125}
+    ind4h = {"price": 130, "ema20": 125, "ema50": 120, "ema200": 110, "atr": 1.2, "vol_ratio": 130}
+    out = regime_strategy_allowlist(ind1h, ind4h)
+    assert "trend_pullback" in out
+    assert "breakout" in out
+    assert "range_bounce" not in out
+
+
+def test_detect_signals_adds_trend_pullback_when_trend_retraces():
+    ind = {
+        "price": 102.0,
+        "rsi": 51.0,
+        "macd_hist": 0.02,
+        "ema20": 101.5,
+        "ema50": 100.8,
+        "ema200": 98.0,
+        "atr": 1.0,
+        "vol_ratio": 110.0,
+        "support": 100.0,
+        "resistance": 106.0,
+    }
+    ind1h = {"price": 110, "ema20": 108, "ema50": 105, "ema200": 100, "atr": 1.0, "vol_ratio": 125}
+    ind4h = {"price": 130, "ema20": 125, "ema50": 120, "ema200": 110, "atr": 1.2, "vol_ratio": 130}
+    sigs = detect_signals(ind, funding=0.0001, ind1h=ind1h, ind4h=ind4h)
+    assert any(s["strategy"] == "trend_pullback" and s["direction"] == "LONG" for s in sigs)
+
+
+def test_detect_signals_adds_range_bounce_in_chop():
+    ind = {
+        "price": 90.8,
+        "rsi": 43.0,
+        "macd_hist": -0.01,
+        "ema20": 91.0,
+        "ema50": 90.9,
+        "ema200": 90.8,
+        "atr": 0.8,
+        "vol_ratio": 95.0,
+        "support": 90.0,
+        "resistance": 95.0,
+    }
+    ind1h = {"price": 91.0, "ema20": 91.1, "ema50": 91.0, "ema200": 90.9, "atr": 0.4, "vol_ratio": 95}
+    ind4h = {"price": 92.0, "ema20": 92.1, "ema50": 92.0, "ema200": 91.9, "atr": 0.5, "vol_ratio": 92}
+    sigs = detect_signals(ind, funding=0.0, ind1h=ind1h, ind4h=ind4h)
+    assert any(s["strategy"] == "range_bounce" and s["direction"] == "LONG" for s in sigs)

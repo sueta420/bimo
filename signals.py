@@ -2,9 +2,52 @@ import time
 
 import numpy as np
 import ta
+import pandas as pd
 
 
 def calc_indicators(df):
+    if df is None or len(df) < 6:
+        return {}
+    if len(df) < 35:
+        recent = df.tail(min(len(df), 48))
+        c = df["close"]
+        v = df["volume"]
+        price = round(float(c.iloc[-1]), 6)
+        try:
+            vol_ma = v.rolling(min(20, len(v))).mean().iloc[-1]
+            vol_r = round(v.iloc[-1] / vol_ma * 100 if vol_ma else 100, 1)
+        except Exception:
+            vol_r = 100.0
+        atr = None
+        try:
+            h = df["high"]
+            l = df["low"]
+            prev_close = c.shift(1)
+            tr = pd.concat(
+                [
+                    (h - l).abs(),
+                    (h - prev_close).abs(),
+                    (l - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr_window = min(14, len(tr))
+            atr = round(float(tr.tail(atr_window).mean()), 6) if atr_window > 0 else None
+        except Exception:
+            atr = None
+        return {
+            "price": price,
+            "rsi": None,
+            "macd_hist": None,
+            "ema20": None,
+            "ema50": None,
+            "ema200": None,
+            "atr": atr,
+            "vol_ratio": vol_r,
+            "support": round(float(recent["low"].min()), 6),
+            "resistance": round(float(recent["high"].max()), 6),
+        }
+
     c = df["close"]
     h = df["high"]
     l = df["low"]
@@ -43,8 +86,25 @@ def calc_indicators(df):
     }
 
 
-def detect_signals(ind, funding):
+def regime_strategy_allowlist(ind1h: dict | None, ind4h: dict | None) -> set[str]:
+    if not ind1h or not ind4h:
+        return {"fakeout", "breakout", "reversal", "trend_pullback", "range_bounce"}
+    r1 = _regime_profile(ind1h)
+    r4 = _regime_profile(ind4h)
+    biases = {r1["bias"], r4["bias"]}
+
+    if biases & {"bull_expansion", "bear_expansion", "bull_trend", "bear_trend"}:
+        return {"breakout", "trend_pullback"}
+    if biases & {"bull_soft", "bear_soft", "mixed"}:
+        return {"fakeout", "trend_pullback", "range_bounce"}
+    if biases <= {"flat", "chop"} or biases & {"flat", "chop"}:
+        return {"fakeout", "range_bounce"}
+    return {"fakeout", "breakout", "trend_pullback", "range_bounce", "reversal"}
+
+
+def detect_signals(ind, funding, ind1h=None, ind4h=None, cfg=None):
     sigs = []
+    allowed = regime_strategy_allowlist(ind1h, ind4h)
     p = ind["price"]
     atr = ind.get("atr") or 0
     rsi = ind.get("rsi")
@@ -58,30 +118,66 @@ def detect_signals(ind, funding):
     if not atr:
         return sigs
 
-    if p > sup * 0.999 and rsi and rsi < 40 and mh and mh > 0 and funding <= 0:
+    if "fakeout" in allowed and p > sup * 0.999 and rsi and rsi < 42 and mh and mh > 0 and funding <= 0:
         sl = round(sup - atr * 0.5, 6)
         tp = round(p + (p - sl) * 3, 6)
         sigs.append({"strategy": "fakeout", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Fakeout LONG RSI={rsi:.1f}"})
-    if p < res * 1.001 and rsi and rsi > 60 and mh and mh < 0 and funding >= 0:
+    if "fakeout" in allowed and p < res * 1.001 and rsi and rsi > 58 and mh and mh < 0 and funding >= 0:
         sl = round(res + atr * 0.5, 6)
         tp = round(p - (sl - p) * 3, 6)
         sigs.append({"strategy": "fakeout", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Fakeout SHORT RSI={rsi:.1f}"})
-    if p > res and rsi and 50 < rsi < 72 and vol > 150 and e20 > e50 and abs(funding) < 0.0008:
+    if "breakout" in allowed and p > res and rsi and 48 < rsi < 74 and vol > 130 and e20 > e50 and abs(funding) < 0.0008:
         sl = round(res - atr * 0.3, 6)
         tp = round(p + (p - sl) * 3, 6)
         sigs.append({"strategy": "breakout", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Breakout LONG vol={vol:.0f}%"})
-    if p < sup and rsi and 28 < rsi < 50 and vol > 150 and e20 < e50 and abs(funding) < 0.0008:
+    if "breakout" in allowed and p < sup and rsi and 26 < rsi < 52 and vol > 130 and e20 < e50 and abs(funding) < 0.0008:
         sl = round(sup + atr * 0.3, 6)
         tp = round(p - (sl - p) * 3, 6)
         sigs.append({"strategy": "breakout", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Breakout SHORT vol={vol:.0f}%"})
-    if rsi and rsi < 35 and mh and mh > 0 and p <= e200 * 1.005 and funding < -0.0003:
+    if "reversal" in allowed and rsi and rsi < 35 and mh and mh > 0 and p <= e200 * 1.005 and funding < -0.0003:
         sl = round(p - atr * 1.5, 6)
         tp = round(p + (p - sl) * 3, 6)
         sigs.append({"strategy": "reversal", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Reversal LONG RSI={rsi:.1f}"})
-    if rsi and rsi > 65 and mh and mh < 0 and p >= e200 * 0.995 and funding > 0.0003:
+    if "reversal" in allowed and rsi and rsi > 65 and mh and mh < 0 and p >= e200 * 0.995 and funding > 0.0003:
         sl = round(p + atr * 1.5, 6)
         tp = round(p - (sl - p) * 3, 6)
         sigs.append({"strategy": "reversal", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Reversal SHORT RSI={rsi:.1f}"})
+
+    pullback_dist_20 = abs(p - e20) / p if p else 0.0
+    pullback_dist_50 = abs(p - e50) / p if p else 0.0
+    if (
+        "trend_pullback" in allowed
+        and rsi is not None
+        and mh is not None
+        and atr
+        and vol >= 95
+        and abs(funding) < 0.0012
+    ):
+        if e20 and e50 and e200 and p > e20 >= e50 > e200 and 44 <= rsi <= 62 and mh >= -0.05 and min(pullback_dist_20, pullback_dist_50) <= 0.012:
+            anchor = min(e20, e50)
+            sl = round(min(anchor, sup) - atr * 0.6, 6)
+            tp = round(p + (p - sl) * 3, 6)
+            if sl < p:
+                sigs.append({"strategy": "trend_pullback", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Trend pullback LONG RSI={rsi:.1f}"})
+        if e20 and e50 and e200 and p < e20 <= e50 < e200 and 38 <= rsi <= 56 and mh <= 0.05 and min(pullback_dist_20, pullback_dist_50) <= 0.012:
+            anchor = max(e20, e50)
+            sl = round(max(anchor, res) + atr * 0.6, 6)
+            tp = round(p - (sl - p) * 3, 6)
+            if sl > p:
+                sigs.append({"strategy": "trend_pullback", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Trend pullback SHORT RSI={rsi:.1f}"})
+
+    range_frac = (p - sup) / max(res - sup, 1e-9)
+    if "range_bounce" in allowed and rsi is not None and mh is not None and atr and abs(funding) < 0.0012:
+        if range_frac <= 0.18 and rsi <= 47 and mh >= -0.02 and vol >= 80:
+            sl = round(sup - atr * 0.45, 6)
+            tp = round(p + (p - sl) * 3, 6)
+            if sl < p:
+                sigs.append({"strategy": "range_bounce", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Range bounce LONG RSI={rsi:.1f}"})
+        if range_frac >= 0.82 and rsi >= 53 and mh <= 0.02 and vol >= 80:
+            sl = round(res + atr * 0.45, 6)
+            tp = round(p - (sl - p) * 3, 6)
+            if sl > p:
+                sigs.append({"strategy": "range_bounce", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Range bounce SHORT RSI={rsi:.1f}"})
     return sigs
 
 
@@ -211,6 +307,30 @@ def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> t
             return False, "regime_flat"
         return True, ""
 
+    if strategy == "range_bounce":
+        if r1["bias"] in opp_side and r4["bias"] in opp_side:
+            return False, "regime_countertrend"
+        if r1["bias"] in {"bull_expansion", "bear_expansion"} or r4["bias"] in {"bull_expansion", "bear_expansion"}:
+            return False, "regime_range_vs_expansion"
+        ok = (
+            r1["bias"] in {"flat", "chop", "mixed", "bull_soft", "bear_soft"}
+            or r4["bias"] in {"flat", "chop", "mixed", "bull_soft", "bear_soft"}
+            or (r1["bias"] in same_side and r4["bias"] not in opp_side)
+            or (r4["bias"] in same_side and r1["bias"] not in opp_side)
+        )
+        return ok, "" if ok else "regime_mismatch"
+
+    if strategy == "trend_pullback":
+        if r1["bias"] in opp_side or r4["bias"] in opp_side:
+            return False, "regime_countertrend"
+        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
+            return False, "regime_flat"
+        ok = (
+            r1["bias"] in (same_side | {"mixed"})
+            and r4["bias"] in (same_side | {"mixed"})
+        )
+        return ok, "" if ok else "regime_mismatch"
+
     if strategy == "fakeout":
         if r4["bias"] in opp_side and r4["bias"] != ("bear_soft" if direction == "LONG" else "bull_soft"):
             return False, "regime_countertrend"
@@ -258,6 +378,14 @@ def btc_context_filter(symbol: str, sig: dict, btc1h: dict, btc4h: dict) -> tupl
             return False, "btc_fakeout_countertrend"
         if r4["bias"] in opp_side and r4["bias"] not in {"bull_soft", "bear_soft"}:
             return False, "btc_fakeout_countertrend"
+    if strategy == "range_bounce":
+        if r1["bias"] in opp_side and r4["bias"] in opp_side:
+            return False, "btc_range_countertrend"
+        if r1["bias"] in {"bull_expansion", "bear_expansion"} and r4["bias"] in {"bull_expansion", "bear_expansion"}:
+            return False, "btc_range_vs_expansion"
+    if strategy == "trend_pullback":
+        if r1["bias"] in opp_side and r4["bias"] in opp_side:
+            return False, "btc_countertrend"
     if strategy == "reversal" and r4["bias"] in same_side and r1["bias"] in same_side:
         return False, "btc_trend_not_exhausted"
     return True, ""
@@ -437,6 +565,39 @@ def score_signal(sig: dict, ind: dict, funding: float, oi_change_pct: float, reg
         if sig["direction"] == "SHORT" and price < (float(ind.get("ema200") or price) * 0.99):
             score -= 5
             reasons.append("reversal_far_from_mean")
+    elif sig["strategy"] == "trend_pullback":
+        score += 5
+        ema20 = float(ind.get("ema20") or price)
+        ema50 = float(ind.get("ema50") or price)
+        dist = min(abs(entry - ema20), abs(entry - ema50)) / max(price, 1e-9)
+        if dist <= 0.008:
+            score += 6
+            reasons.append("pullback_near_value")
+        elif dist >= 0.02:
+            score -= 6
+            reasons.append("pullback_far_from_value")
+        if vol >= 100:
+            score += 3
+            reasons.append("pullback_volume_ok")
+    elif sig["strategy"] == "range_bounce":
+        score += 3
+        if sig["direction"] == "LONG":
+            if range_frac <= 0.12:
+                score += 6
+                reasons.append("range_near_support")
+            elif range_frac >= 0.3:
+                score -= 5
+                reasons.append("range_not_near_support")
+        else:
+            if range_frac >= 0.88:
+                score += 6
+                reasons.append("range_near_resistance")
+            elif range_frac <= 0.7:
+                score -= 5
+                reasons.append("range_not_near_resistance")
+        if vol < 85:
+            score -= 4
+            reasons.append("range_volume_soft")
 
     if abs(float(ind.get("ema20") or price) - float(ind.get("ema50") or price)) / price >= 0.003:
         score += 3

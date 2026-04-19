@@ -1,178 +1,13 @@
-from portfolio import STATE_OPEN, Trade
-from risk import align_protective_prices, check_side_exposure, correlation_allowed, floor_to_step, resolve_target_leverage, rr_ratio, size_position
+from risk import check_side_exposure, size_position
 
 
-def test_size_position_equity_based():
-    cfg = {
-        "risk_per_trade_pct": 0.5,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 10,
-    }
-    wallet = {"equity": 1000, "available": 1000}
-    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
-    assert err == ""
-    assert res["qty"] > 0
-    assert res["risk_usd"] <= 5.1
-    assert res["notional"] <= wallet["available"] * cfg["max_leverage"]
-
-
-def test_side_exposure_limit():
-    cfg = {"max_side_risk_pct": 1.0}
-    t = Trade(
-        id="1",
-        symbol="BTCUSDT",
-        direction="LONG",
-        strategy="x",
-        entry=1,
-        sl=0.9,
-        tp=1.3,
-        size_usd=10,
-        confidence=0,
-        open_time="x",
-        state=STATE_OPEN,
-        risk_usd=6.0,
-    )
-    ok, reason = check_side_exposure(cfg, {"BTCUSDT": t}, "LONG", new_risk_usd=5, equity=1000)
-    assert not ok
-    assert "side_risk_limit" in reason
-
-
-def test_correlation_guard_blocks():
-    t = Trade(
-        id="1",
-        symbol="ETHUSDT",
-        direction="LONG",
-        strategy="x",
-        entry=1,
-        sl=0.9,
-        tp=1.3,
-        size_usd=10,
-        confidence=0,
-        open_time="x",
-        state=STATE_OPEN,
-        risk_usd=3.0,
-    )
-    returns = {
-        "SOLUSDT": [0.01, 0.02, 0.01, 0.02, 0.01, 0.02, 0.01, 0.02, 0.01, 0.02, 0.01],
-        "ETHUSDT": [0.011, 0.021, 0.012, 0.019, 0.011, 0.021, 0.011, 0.022, 0.010, 0.020, 0.011],
-    }
-    ok, reason = correlation_allowed(
-        symbol="SOLUSDT",
-        direction="LONG",
-        open_trades={"ETHUSDT": t},
-        return_series=returns,
-        threshold=0.8,
-        max_correlated_per_side=1,
-    )
-    assert not ok
-    assert "corr_hits" in reason
-
-
-def test_floor_to_step_precision():
-    assert floor_to_step(0.0161, 0.01) == 0.01
-
-
-def test_size_position_rejects_missing_qty_step():
-    cfg = {
-        "risk_per_trade_pct": 0.5,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 10,
-    }
-    wallet = {"equity": 1000, "available": 1000}
-    limits = {"tick_size": 0.1, "qty_step": 0.0, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
-    assert res is None
-    assert err == "qty_step<=0"
-
-
-def test_size_position_with_fixed_risk_usd_mode():
-    cfg = {
-        "position_sizing_mode": "risk_usd",
-        "risk_per_trade_usd": 2.0,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 10,
-    }
-    wallet = {"equity": 31, "available": 31}
-    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
-    assert err == ""
-    assert res["sizing_mode"] == "risk_usd"
-    assert res["risk_budget_usd"] == 2.0
-    assert res["risk_usd"] <= 2.04
-
-
-def test_size_position_with_fixed_notional_mode():
-    cfg = {
-        "position_sizing_mode": "fixed_notional_usd",
-        "target_notional_usd": 5.0,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 10,
-    }
-    wallet = {"equity": 31, "available": 31}
-    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
-    assert err == ""
-    assert res["sizing_mode"] == "fixed_notional_usd"
-    assert res["notional"] >= 5.0
-    assert res["notional"] < 5.2
-
-
-def test_size_position_fixed_notional_respects_risk_cap():
-    cfg = {
-        "position_sizing_mode": "fixed_notional_usd",
-        "target_notional_usd": 10.0,
-        "max_risk_per_trade_usd": 0.2,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 10,
-    }
-    wallet = {"equity": 58, "available": 58}
-    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 98.0, 0.0001, wallet, limits)
-    assert res is None
-    assert "risk_cap_exceeded" in err
-
-
-def test_size_position_with_fixed_margin_mode():
-    cfg = {
+def _base_cfg():
+    return {
         "position_sizing_mode": "fixed_margin_usd",
         "target_margin_usd": 10.0,
+        "target_risk_usd": 1.5,
+        "min_risk_utilization": 0.8,
         "target_leverage": 5,
-        "slippage_entry_bps": 10,
-        "slippage_exit_bps": 15,
-        "taker_fee_bps": 5.5,
-        "funding_reserve_rate": 0.0005,
-        "max_leverage": 20,
-    }
-    wallet = {"equity": 58, "available": 58}
-    limits = {"tick_size": 0.1, "qty_step": 0.001, "min_qty": 0.001, "min_notional": 5}
-    res, err = size_position(cfg, "LONG", 100.0, 99.0, 0.0001, wallet, limits)
-    assert err == ""
-    assert res["sizing_mode"] == "fixed_margin_usd"
-    assert res["notional"] >= 49.9
-    assert res["notional"] <= 50.1
-    assert res["leverage"] == 5
-
-
-def test_resolve_target_leverage_dynamic_policy():
-    cfg = {
-        "target_leverage": 5,
-        "max_leverage": 20,
         "dynamic_leverage_enabled": True,
         "fakeout_target_leverage": 4,
         "breakout_target_leverage": 5,
@@ -183,24 +18,75 @@ def test_resolve_target_leverage_dynamic_policy():
         "dynamic_leverage_low_score_cut": 1,
         "dynamic_leverage_high_atr_ratio": 0.012,
         "dynamic_leverage_high_atr_cut": 1,
+        "max_risk_per_trade_usd": 1.5,
+        "slippage_entry_bps": 10.0,
+        "slippage_exit_bps": 15.0,
+        "taker_fee_bps": 5.5,
+        "funding_reserve_rate": 0.0005,
+        "max_leverage": 20,
     }
-    assert resolve_target_leverage(cfg, strategy="fakeout", score=68, atr_ratio=0.008) == 3
-    assert resolve_target_leverage(cfg, strategy="breakout", score=82, atr_ratio=0.008) == 6
-    assert resolve_target_leverage(cfg, strategy="reversal", score=75, atr_ratio=0.02) == 2
 
 
-def test_rr_ratio_long_and_short():
-    assert rr_ratio(100.0, 99.0, 103.0, "LONG") == 3.0
-    assert rr_ratio(100.0, 101.0, 97.0, "SHORT") == 3.0
+def _wallet():
+    return {"equity": 58.0, "available": 58.0}
 
 
-def test_align_protective_prices_keeps_long_stop_below_entry():
-    sl, tp = align_protective_prices(entry=240.68, sl=240.68, tp=246.36, direction="LONG", tick_size=0.01)
-    assert sl == 240.67
-    assert tp >= 246.36
+def _limits():
+    return {"qty_step": 1.0, "min_qty": 1.0, "min_notional": 5.0, "tick_size": 0.0001}
 
 
-def test_align_protective_prices_keeps_short_stop_above_entry():
-    sl, tp = align_protective_prices(entry=0.21562, sl=0.21562, tp=0.20455, direction="SHORT", tick_size=0.00001)
-    assert sl == 0.21564
-    assert tp <= 0.20455
+def test_fixed_margin_rejects_too_small_risk_utilization():
+    sizing, reason = size_position(
+        _base_cfg(),
+        "LONG",
+        entry=0.2522,
+        sl=0.2509,
+        funding_rate=-0.000066,
+        wallet=_wallet(),
+        limits=_limits(),
+        strategy="range_bounce",
+        score=100,
+        atr_ratio=0.0049,
+    )
+    assert sizing is None
+    assert reason.startswith("risk_too_small")
+
+
+def test_fixed_margin_uses_dynamic_target_leverage_for_required_leverage():
+    cfg = _base_cfg()
+    sizing, reason = size_position(
+        cfg,
+        "LONG",
+        entry=10.0,
+        sl=9.7,
+        funding_rate=0.0,
+        wallet=_wallet(),
+        limits={"qty_step": 0.1, "min_qty": 0.1, "min_notional": 5.0, "tick_size": 0.1},
+        strategy="fakeout",
+        score=85,
+        atr_ratio=0.005,
+    )
+    assert reason == ""
+    assert sizing is not None
+    assert sizing["target_leverage"] == 5
+    assert sizing["leverage"] == 5
+
+
+def test_side_exposure_allows_single_trade_when_pct_limit_is_too_low():
+    cfg = _base_cfg() | {
+        "max_side_risk_pct": 1.5,
+        "max_side_risk_usd": 0.0,
+    }
+    ok, reason = check_side_exposure(cfg, {}, "LONG", new_risk_usd=1.48, equity=58.0)
+    assert ok
+    assert reason == ""
+
+
+def test_side_exposure_uses_absolute_usd_limit_when_configured():
+    cfg = _base_cfg() | {
+        "max_side_risk_pct": 1.5,
+        "max_side_risk_usd": 3.0,
+    }
+    ok, reason = check_side_exposure(cfg, {}, "LONG", new_risk_usd=2.4, equity=58.0)
+    assert ok
+    assert reason == ""

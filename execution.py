@@ -92,6 +92,46 @@ def summarize_reasons(reasons: list[str], limit: int = 4) -> str:
     return ",".join(head) if head else "-"
 
 
+def planned_exit_metrics(t: Trade) -> dict:
+    close_price = float(t.close_price or 0.0)
+    if close_price <= 0:
+        return {}
+    sl = float(t.sl or 0.0)
+    tp = float(t.tp or 0.0)
+    planned_kind = ""
+    planned_price = 0.0
+    pnl = float(t.pnl_usd or 0.0)
+    if pnl < 0 and sl > 0:
+        planned_kind = "SL"
+        planned_price = sl
+    elif pnl > 0 and tp > 0:
+        planned_kind = "TP"
+        planned_price = tp
+    else:
+        options = []
+        if sl > 0:
+            options.append(("SL", sl))
+        if tp > 0:
+            options.append(("TP", tp))
+        if options:
+            planned_kind, planned_price = min(options, key=lambda item: abs(close_price - item[1]))
+    if planned_price <= 0:
+        return {}
+    slippage_price = close_price - planned_price
+    qty = float(t.filled_qty or t.qty or 0.0)
+    if t.direction == "LONG":
+        slippage_pnl = slippage_price * qty
+    else:
+        slippage_pnl = (planned_price - close_price) * qty
+    return {
+        "planned_kind": planned_kind,
+        "planned_price": planned_price,
+        "actual_price": close_price,
+        "slippage_price": slippage_price,
+        "slippage_pnl_usd": slippage_pnl,
+    }
+
+
 def _strategy_rows(trades: list[Trade]) -> str:
     if not trades:
         return ""
@@ -211,11 +251,57 @@ class Agent:
         if mode == "fixed_notional_usd":
             return f"fixed_notional=${float(self.cfg.get('target_notional_usd', 0) or 0):.4f}"
         if mode == "fixed_margin_usd":
+            base_lev = int(self.cfg.get("target_leverage", 1) or 1)
+            if self.cfg.get("dynamic_leverage_enabled"):
+                return (
+                    f"fixed_margin=${float(self.cfg.get('target_margin_usd', 0) or 0):.4f} "
+                    f"leverage=adaptive(base={base_lev}x)"
+                )
             return (
-                f"fixed_margin=${float(self.cfg.get('target_margin_usd', 0) or 0):.4f}"
-                f"@{int(self.cfg.get('target_leverage', 1) or 1)}x"
+                f"fixed_margin=${float(self.cfg.get('target_margin_usd', 0) or 0):.4f} "
+                f"leverage=fixed({base_lev}x)"
             )
         return f"risk_pct={float(self.cfg.get('risk_per_trade_pct', 0) or 0):.4f}%"
+
+    def _leverage_mode_label(self, sizing: dict) -> str:
+        actual = int(sizing.get("leverage", 1) or 1)
+        target = int(sizing.get("target_leverage", actual) or actual)
+        if self.cfg.get("dynamic_leverage_enabled"):
+            base = int(self.cfg.get("target_leverage", 1) or 1)
+            return f"adaptive actual={actual}x base={base}x target={target}x"
+        return f"fixed {actual}x"
+
+    def _close_message_text(self, t: Trade, title: str, reason_label: str | None = None) -> str:
+        lines = [
+            f"{title}: {t.symbol} {t.direction}",
+            f"Strategy: {t.strategy}",
+            f"PnL: {(t.pnl_usd or 0):+.4f}$",
+        ]
+        if reason_label:
+            lines.append(f"Причина: {reason_label}")
+        metrics = planned_exit_metrics(t)
+        if metrics:
+            lines.append(f"Planned {metrics['planned_kind']}: {float(metrics['planned_price']):.6f}")
+            lines.append(f"Actual exit: {float(metrics['actual_price']):.6f}")
+            lines.append(
+                "Exit slippage: "
+                f"{float(metrics['slippage_price']):+.6f} ({float(metrics['slippage_pnl_usd']):+.4f}$)"
+            )
+        return "\n".join(lines)
+
+    def _log_close_metrics(self, t: Trade):
+        metrics = planned_exit_metrics(t)
+        if not metrics:
+            return
+        self.log.info(
+            "exit_compare "
+            f"symbol={t.symbol} direction={t.direction} "
+            f"planned_kind={metrics['planned_kind']} "
+            f"planned_price={float(metrics['planned_price']):.6f} "
+            f"actual_price={float(metrics['actual_price']):.6f} "
+            f"slippage_price={float(metrics['slippage_price']):+.6f} "
+            f"slippage_pnl={float(metrics['slippage_pnl_usd']):+.4f}"
+        )
 
     def _clear_critical_errors(self):
         current_errors = int(getattr(self.stats, "critical_errors", 0) or 0)
@@ -277,6 +363,15 @@ class Agent:
         base = max(int(self.cfg.get("max_scan_symbols", 20) or 20), 1)
         if time.time() < self._rate_limit_backoff_until:
             return max(5, base // 2)
+        return base
+
+    def _min_atr_ratio_for_symbol(self, symbol: str) -> float:
+        base = float(self.cfg.get("min_atr_ratio", 0.005) or 0.005)
+        majors = {str(x).upper() for x in self.cfg.get("major_symbols", [])}
+        if str(symbol or "").upper() in majors:
+            major_base = float(self.cfg.get("min_atr_ratio_majors", 0.0) or 0.0)
+            if major_base > 0:
+                return major_base
         return base
 
     def _btc_filter(self, symbol: str, sig: dict, btc1h: dict | None, btc4h: dict | None) -> tuple[bool, str]:
@@ -406,6 +501,28 @@ class Agent:
                 f"Последняя: {key} {symbol} {ex}",
             )
 
+    def _is_transient_external_error(self, ex: Exception) -> bool:
+        checker = getattr(self.ex, "_is_retryable_read_error", None)
+        if callable(checker):
+            try:
+                if bool(checker(ex)):
+                    return True
+            except Exception:
+                pass
+        text = str(ex or "").lower()
+        return any(
+            token in text
+            for token in (
+                "name resolution",
+                "failed to resolve",
+                "nodename nor servname provided",
+                "temporary failure in name resolution",
+                "connection reset by peer",
+                "ssl",
+                "handshake operation timed out",
+            )
+        )
+
     def _load_local_state(self):
         for t in self.store.load_active_trades():
             self.open_trades[t.symbol] = t
@@ -416,8 +533,11 @@ class Agent:
         try:
             positions = self.ex.list_positions()
         except Exception as ex:
-            self.log.error(f"recovery_positions_failed={ex}")
-            self.tg.send_error("recovery", f"Recovery positions failed: {ex}")
+            if self._is_transient_external_error(ex):
+                self.log.warning(f"recovery_positions_retryable={ex}")
+            else:
+                self.log.error(f"recovery_positions_failed={ex}")
+                self.tg.send_error("recovery", f"Recovery positions failed: {ex}")
             return
 
         pos_map = {p.get("symbol"): p for p in positions if p.get("symbol")}
@@ -685,13 +805,14 @@ class Agent:
                     closed_info = self._closed_trade_info(sym, t.open_time_ms)
                     t.pnl_usd = (closed_info or {}).get("pnl_usd", self.ex.realized_pnl_from_exchange(sym, t.open_time_ms))
                     self._finalize_trade_analytics(t, closed_info)
+                    self._log_close_metrics(t)
                     self._safe_save_trade(t)
                     self.stats.trades.append(t)
                     self._save_day_stats()
                     self._set_state(t, STATE_CLOSED, "close_all", {"reason": reason, "pnl": t.pnl_usd})
                     self._set_state(t, STATE_RECONCILED, "close_all_reconciled")
                     self.tg.send(
-                        f"Закрыта позиция {sym} {t.direction}\nПричина: {reason}\nPnL: {(t.pnl_usd or 0):+.4f}$",
+                        self._close_message_text(t, "Закрыта позиция", reason),
                         force=True,
                     )
                     self._clear_critical_errors()
@@ -756,6 +877,7 @@ class Agent:
                     if t.pnl_usd is None:
                         self.log.warning(f"pnl_unresolved symbol={sym} open_time_ms={t.open_time_ms}")
                     self._finalize_trade_analytics(t, closed_info)
+                    self._log_close_metrics(t)
                     self._safe_save_trade(t)
                     self.stats.trades.append(t)
                     self._set_state(t, STATE_CLOSED, "sync_closed", {"pnl": t.pnl_usd})
@@ -766,7 +888,7 @@ class Agent:
                         self._set_stop_cooldown(sym)
                     self._save_day_stats()
                     self.tg.send(
-                        f"Позиция закрыта: {sym} {t.direction}\nStrategy: {t.strategy}\nPnL: {(t.pnl_usd or 0):+.4f}$",
+                        self._close_message_text(t, "Позиция закрыта"),
                         force=True,
                     )
                     del self.open_trades[sym]
@@ -921,11 +1043,12 @@ class Agent:
             try:
                 df = self.ex.klines(sym, self.cfg["entry_tf"])
                 ind = calc_indicators(df)
-                if not ind.get("atr") or ind["atr"] / ind["price"] < self.cfg["min_atr_ratio"]:
+                atr_ratio = float(ind.get("atr") or 0.0) / max(float(ind.get("price") or 1.0), 1e-9)
+                min_atr_ratio = self._min_atr_ratio_for_symbol(sym)
+                if not ind.get("atr") or atr_ratio < min_atr_ratio:
                     self.log.info(
                         f"cycle_id={self._cycle_seq} analyze_symbol_skip symbol={sym} reason=min_atr_ratio "
-                        f"atr_ratio={(float(ind.get('atr') or 0.0) / max(float(ind.get('price') or 1.0), 1e-9)):.4f} "
-                        f"min_atr_ratio={self.cfg['min_atr_ratio']}"
+                        f"atr_ratio={atr_ratio:.4f} min_atr_ratio={min_atr_ratio:.4f}"
                     )
                     cycle_summary["skips"] += 1
                     continue
@@ -948,7 +1071,7 @@ class Agent:
                 ind1h = calc_indicators(self.ex.klines(sym, self.cfg["regime_tf_1"]))
                 ind4h = calc_indicators(self.ex.klines(sym, self.cfg["regime_tf_2"]))
 
-                sigs = detect_signals(ind, fr)
+                sigs = detect_signals(ind, fr, ind1h, ind4h, self.cfg)
                 self.stats.signals_total += len(sigs)
                 self._save_day_stats()
                 self.log.info(f"cycle_id={self._cycle_seq} analyze_symbol_signals symbol={sym} signals={len(sigs)}")
@@ -1263,7 +1386,8 @@ class Agent:
                     reasons=item["reasons"],
                 )
                 self.log.info(
-                    f"opened symbol={sym} direction={direction} qty={t.qty} lev={sizing['leverage']} "
+                    f"opened symbol={sym} direction={direction} qty={t.qty} leverage_mode={self._leverage_mode_label(sizing)} "
+                    f"lev={sizing['leverage']} "
                     f"target_lev={sizing.get('target_leverage', sizing['leverage'])} "
                     f"strategy={t.strategy} atr_ratio={(float(item['ind'].get('atr', 0.0) or 0.0) / max(float(item['ind'].get('price', 1.0) or 1.0), 1e-9)):.4f} "
                     f"risk={sizing['risk_usd']:.4f} score={item['score']} rr={item.get('rr', 0.0):.3f} "
@@ -1271,7 +1395,7 @@ class Agent:
                 )
                 self.tg.send(
                     f"Открыта позиция {sym} {direction}\n"
-                    f"Score: {item['score']} | Qty: {t.qty} | Lev: {sizing['leverage']}x\n"
+                    f"Score: {item['score']} | Qty: {t.qty} | Leverage: {self._leverage_mode_label(sizing)}\n"
                     f"Risk: {sizing['risk_usd']:.4f}$ | Entry: {t.entry} | SL: {t.sl} | TP: {t.tp}\n"
                     + (f"LLM: {explain}" if explain else ""),
                     force=True,
@@ -1311,9 +1435,13 @@ class Agent:
                 self.tg.send(self.day_summary_text("Агент остановлен. Итог дня", open_before_close), force=True)
                 break
             except Exception as ex:
-                self.log.error(f"cycle_failed err={ex}")
-                self.tg.send_error("cycle", f"Цикл: {ex}")
-                self._record_critical_error("cycle_failed", ex)
+                if self._is_transient_external_error(ex):
+                    self.log.warning(f"cycle_external_transient err={ex}")
+                    self.tg.send_error("cycle_transient", f"Временный внешний сбой цикла: {ex}")
+                else:
+                    self.log.error(f"cycle_failed err={ex}")
+                    self.tg.send_error("cycle", f"Цикл: {ex}")
+                    self._record_critical_error("cycle_failed", ex)
             self._save_heartbeat()
             self.log.info(f"sleep_sec={self.cfg['cycle_sec']}")
             await asyncio.sleep(self.cfg["cycle_sec"])

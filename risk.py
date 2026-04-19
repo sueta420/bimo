@@ -141,6 +141,8 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits, strat
         if target_leverage <= 0:
             return None, "target_leverage<=0"
         target_notional_usd = target_margin_usd * target_leverage
+    else:
+        target_leverage = max(1, int(cfg.get("target_leverage", 1) or 1))
 
     slip_in = float(cfg["slippage_entry_bps"]) / 10_000.0
     slip_out = float(cfg["slippage_exit_bps"]) / 10_000.0
@@ -172,10 +174,15 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits, strat
 
     entry_adj = round_to_step(entry_px, tick_size)
     sl_adj = round_to_step(sl_px, tick_size)
+    target_risk_usd = float(cfg.get("target_risk_usd", 0) or 0)
+    min_risk_utilization = float(cfg.get("min_risk_utilization", 0) or 0)
     if mode in {"fixed_notional_usd", "fixed_margin_usd"}:
         if entry_adj <= 0:
             return None, "entry<=0"
         qty_raw = target_notional_usd / entry_adj
+        if target_risk_usd > 0:
+            target_qty_risk = target_risk_usd / per_unit_loss
+            qty_raw = min(qty_raw, target_qty_risk)
     else:
         qty_raw = risk_budget_usd / per_unit_loss
     qty = floor_to_step(qty_raw, qty_step) if qty_step > 0 else qty_raw
@@ -201,11 +208,16 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits, strat
     max_risk_cap = float(cfg.get("max_risk_per_trade_usd", 0) or 0)
     if max_risk_cap > 0 and effective_risk > max_risk_cap:
         return None, f"risk_cap_exceeded {effective_risk:.4f}>{max_risk_cap:.4f}"
+    target_risk_cap = target_risk_usd if target_risk_usd > 0 else max_risk_cap
+    if mode in {"fixed_notional_usd", "fixed_margin_usd"} and target_risk_cap > 0 and min_risk_utilization > 0:
+        min_required_risk = target_risk_cap * min_risk_utilization
+        if effective_risk < min_required_risk:
+            return None, f"risk_too_small {effective_risk:.4f}<{min_required_risk:.4f}"
     if mode not in {"fixed_notional_usd", "fixed_margin_usd"} and effective_risk > risk_budget_usd * 1.02:
         return None, f"effective_risk>{risk_budget_usd:.4f}"
 
     if mode == "fixed_margin_usd":
-        req_lev = max(1, int(cfg.get("target_leverage", 1) or 1))
+        req_lev = max(1, int(target_leverage or 1))
     else:
         req_lev = max(1, math.ceil(notional / available))
     if req_lev > int(cfg["max_leverage"]):
@@ -226,7 +238,13 @@ def size_position(cfg, direction, entry, sl, funding_rate, wallet, limits, strat
 
 def check_side_exposure(cfg, open_trades: dict[str, Trade], direction: str, new_risk_usd: float, equity: float) -> tuple[bool, str]:
     exp = side_exposure_risk(open_trades)
-    limit = equity * float(cfg["max_side_risk_pct"]) / 100.0
+    limit_pct = equity * float(cfg["max_side_risk_pct"]) / 100.0
+    limit_usd = float(cfg.get("max_side_risk_usd", 0.0) or 0.0)
+    single_trade_floor = max(
+        float(cfg.get("target_risk_usd", 0.0) or 0.0),
+        float(cfg.get("max_risk_per_trade_usd", 0.0) or 0.0),
+    )
+    limit = max(limit_pct, limit_usd, single_trade_floor)
     after = exp.get(direction, 0.0) + float(new_risk_usd or 0.0)
     if after > limit:
         return False, f"side_risk_limit {after:.4f}>{limit:.4f}"

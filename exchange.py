@@ -190,20 +190,58 @@ def normalize_order_qty(
 
 class BybitClient:
     def __init__(self, cfg):
+        self.cfg = cfg
         self.s = HTTP(
             testnet=cfg["testnet"],
             api_key=cfg["api_key"],
             api_secret=cfg["api_secret"],
+            timeout=int(cfg.get("bybit_http_timeout_sec", 20) or 20),
         )
         self._instrument_cache = {}
         self._ticker_cache = {}
         self._ticker_cache_ts = 0.0
 
+    def _is_retryable_read_error(self, ex: Exception) -> bool:
+        text = str(ex or "").lower()
+        return any(
+            token in text
+            for token in (
+                "read timed out",
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "connection aborted",
+                "connection reset",
+                "connection refused",
+                "name resolution",
+                "temporary failure in name resolution",
+                "nodename nor servname provided",
+                "failed to resolve",
+                "max retries exceeded",
+                "connection pool",
+                "too many visits",
+                "errcode: 10006",
+            )
+        )
+
+    def _call_with_retry(self, fn, *args, **kwargs):
+        retries = max(int(self.cfg.get("bybit_read_retries", 2) or 2), 0)
+        delay_sec = max(float(self.cfg.get("bybit_read_retry_delay_ms", 800) or 800) / 1000.0, 0.0)
+        attempt = 0
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as ex:
+                if attempt >= retries or not self._is_retryable_read_error(ex):
+                    raise
+                attempt += 1
+                time.sleep(delay_sec)
+
     def tickers(self):
         now = time.time()
         if self._ticker_cache and (now - self._ticker_cache_ts) < 3:
             return list(self._ticker_cache.values())
-        out = self.s.get_tickers(category="linear")["result"]["list"]
+        out = self._call_with_retry(self.s.get_tickers, category="linear")["result"]["list"]
         self._ticker_cache = {x.get("symbol"): x for x in out}
         self._ticker_cache_ts = now
         return out
@@ -211,7 +249,7 @@ class BybitClient:
     def ticker(self, symbol: str):
         if symbol in self._ticker_cache:
             return self._ticker_cache[symbol]
-        r = self.s.get_tickers(category="linear", symbol=symbol)
+        r = self._call_with_retry(self.s.get_tickers, category="linear", symbol=symbol)
         items = r.get("result", {}).get("list", [])
         if items:
             self._ticker_cache[symbol] = items[0]
@@ -219,7 +257,7 @@ class BybitClient:
         return {}
 
     def klines(self, symbol, interval, limit=200):
-        r = self.s.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
+        r = self._call_with_retry(self.s.get_kline, category="linear", symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(
             r["result"]["list"],
             columns=["ts", "open", "high", "low", "close", "volume", "turnover"],
@@ -236,7 +274,7 @@ class BybitClient:
 
     def open_interest(self, symbol):
         try:
-            r = self.s.get_open_interest(category="linear", symbol=symbol, intervalTime="1h", limit=2)
+            r = self._call_with_retry(self.s.get_open_interest, category="linear", symbol=symbol, intervalTime="1h", limit=2)
             items = r["result"]["list"]
             if len(items) >= 2:
                 c = float(items[0]["openInterest"])
@@ -303,14 +341,14 @@ class BybitClient:
         )
 
     def get_pos(self, symbol):
-        r = self.s.get_positions(category="linear", symbol=symbol)
+        r = self._call_with_retry(self.s.get_positions, category="linear", symbol=symbol)
         for p in r["result"]["list"]:
             if float(p.get("size", 0) or 0) > 0:
                 return p
         return None
 
     def list_positions(self):
-        r = self.s.get_positions(category="linear", settleCoin="USDT")
+        r = self._call_with_retry(self.s.get_positions, category="linear", settleCoin="USDT")
         out = []
         for p in r.get("result", {}).get("list", []):
             try:
@@ -333,7 +371,7 @@ class BybitClient:
         return {"sl": sl, "tp": tp}
 
     def wallet_snapshot(self):
-        r = self.s.get_wallet_balance(accountType="UNIFIED")
+        r = self._call_with_retry(self.s.get_wallet_balance, accountType="UNIFIED")
         lst = r.get("result", {}).get("list", [])
         if not lst:
             return {"equity": 0.0, "available": 0.0}
@@ -345,7 +383,7 @@ class BybitClient:
     def instrument_constraints(self, symbol):
         if symbol in self._instrument_cache:
             return self._instrument_cache[symbol]
-        r = self.s.get_instruments_info(category="linear", symbol=symbol)
+        r = self._call_with_retry(self.s.get_instruments_info, category="linear", symbol=symbol)
         items = r.get("result", {}).get("list", [])
         if not items:
             raise RuntimeError(f"instrument info not found for {symbol}")
