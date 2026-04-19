@@ -5,6 +5,10 @@ import ta
 import pandas as pd
 
 
+ALL_STRATEGIES = {"trend_pullback", "range_bounce"}
+V2_LITE_STRATEGIES = {"trend_pullback", "range_bounce"}
+
+
 def calc_indicators(df):
     if df is None or len(df) < 6:
         return {}
@@ -86,25 +90,43 @@ def calc_indicators(df):
     }
 
 
-def regime_strategy_allowlist(ind1h: dict | None, ind4h: dict | None) -> set[str]:
+def _apply_enabled_strategies(allowed: set[str], cfg: dict | None = None) -> set[str]:
+    profile = str((cfg or {}).get("agent_profile") or "").strip().lower()
+    configured = {
+        str(x).strip().lower()
+        for x in (cfg or {}).get("enabled_strategies", [])
+        if str(x).strip()
+    }
+    configured &= ALL_STRATEGIES
+    if profile == "v2-lite":
+        base = V2_LITE_STRATEGIES
+        if configured:
+            configured &= base
+        return allowed & (configured or base)
+    if not configured:
+        return allowed
+    return allowed & configured
+
+
+def regime_strategy_allowlist(ind1h: dict | None, ind4h: dict | None, cfg: dict | None = None) -> set[str]:
     if not ind1h or not ind4h:
-        return {"fakeout", "breakout", "reversal", "trend_pullback", "range_bounce"}
+        return _apply_enabled_strategies(set(ALL_STRATEGIES), cfg)
     r1 = _regime_profile(ind1h)
     r4 = _regime_profile(ind4h)
     biases = {r1["bias"], r4["bias"]}
+    trend_biases = {"bull_expansion", "bear_expansion", "bull_trend", "bear_trend"}
+    range_biases = {"flat", "chop"}
 
-    if biases & {"bull_expansion", "bear_expansion", "bull_trend", "bear_trend"}:
-        return {"breakout", "trend_pullback"}
-    if biases & {"bull_soft", "bear_soft", "mixed"}:
-        return {"fakeout", "trend_pullback", "range_bounce"}
-    if biases <= {"flat", "chop"} or biases & {"flat", "chop"}:
-        return {"fakeout", "range_bounce"}
-    return {"fakeout", "breakout", "trend_pullback", "range_bounce", "reversal"}
+    if biases <= range_biases:
+        return _apply_enabled_strategies({"range_bounce"}, cfg)
+    if biases & trend_biases and not (biases & range_biases):
+        return _apply_enabled_strategies({"trend_pullback"}, cfg)
+    return _apply_enabled_strategies({"trend_pullback", "range_bounce"}, cfg)
 
 
 def detect_signals(ind, funding, ind1h=None, ind4h=None, cfg=None):
     sigs = []
-    allowed = regime_strategy_allowlist(ind1h, ind4h)
+    allowed = regime_strategy_allowlist(ind1h, ind4h, cfg)
     p = ind["price"]
     atr = ind.get("atr") or 0
     rsi = ind.get("rsi")
@@ -117,31 +139,7 @@ def detect_signals(ind, funding, ind1h=None, ind4h=None, cfg=None):
     res = ind["resistance"]
     if not atr:
         return sigs
-
-    if "fakeout" in allowed and p > sup * 0.999 and rsi and rsi < 42 and mh and mh > 0 and funding <= 0:
-        sl = round(sup - atr * 0.5, 6)
-        tp = round(p + (p - sl) * 3, 6)
-        sigs.append({"strategy": "fakeout", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Fakeout LONG RSI={rsi:.1f}"})
-    if "fakeout" in allowed and p < res * 1.001 and rsi and rsi > 58 and mh and mh < 0 and funding >= 0:
-        sl = round(res + atr * 0.5, 6)
-        tp = round(p - (sl - p) * 3, 6)
-        sigs.append({"strategy": "fakeout", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Fakeout SHORT RSI={rsi:.1f}"})
-    if "breakout" in allowed and p > res and rsi and 48 < rsi < 74 and vol > 130 and e20 > e50 and abs(funding) < 0.0008:
-        sl = round(res - atr * 0.3, 6)
-        tp = round(p + (p - sl) * 3, 6)
-        sigs.append({"strategy": "breakout", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Breakout LONG vol={vol:.0f}%"})
-    if "breakout" in allowed and p < sup and rsi and 26 < rsi < 52 and vol > 130 and e20 < e50 and abs(funding) < 0.0008:
-        sl = round(sup + atr * 0.3, 6)
-        tp = round(p - (sl - p) * 3, 6)
-        sigs.append({"strategy": "breakout", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Breakout SHORT vol={vol:.0f}%"})
-    if "reversal" in allowed and rsi and rsi < 35 and mh and mh > 0 and p <= e200 * 1.005 and funding < -0.0003:
-        sl = round(p - atr * 1.5, 6)
-        tp = round(p + (p - sl) * 3, 6)
-        sigs.append({"strategy": "reversal", "direction": "LONG", "entry": p, "sl": sl, "tp": tp, "why": f"Reversal LONG RSI={rsi:.1f}"})
-    if "reversal" in allowed and rsi and rsi > 65 and mh and mh < 0 and p >= e200 * 0.995 and funding > 0.0003:
-        sl = round(p + atr * 1.5, 6)
-        tp = round(p - (sl - p) * 3, 6)
-        sigs.append({"strategy": "reversal", "direction": "SHORT", "entry": p, "sl": sl, "tp": tp, "why": f"Reversal SHORT RSI={rsi:.1f}"})
+    active = set(allowed)
 
     pullback_dist_20 = abs(p - e20) / p if p else 0.0
     pullback_dist_50 = abs(p - e50) / p if p else 0.0
@@ -184,6 +182,27 @@ def detect_signals(ind, funding, ind1h=None, ind4h=None, cfg=None):
 def screen_coins(ex, cfg):
     result = []
     blacklist = {str(x).upper() for x in cfg.get("symbol_blacklist", [])}
+    major_symbols = {str(x).upper() for x in cfg.get("major_symbols", [])}
+    min_move_pct = float(cfg.get("universe_min_daily_move_pct", 0.8) or 0.8)
+    max_move_pct = float(cfg.get("universe_max_daily_move_pct", 18.0) or 18.0)
+
+    def universe_score(sym: str, turnover_24h: float, funding_abs: float, day_move_pct: float) -> float:
+        liquidity_score = min(turnover_24h / max(float(cfg["min_volume_24h"]), 1.0), 6.0)
+        funding_score = max(
+            0.0,
+            1.5 - (funding_abs / max(float(cfg.get("max_funding_abs", 0.001) or 0.001), 1e-9)),
+        )
+        if day_move_pct <= 0:
+            move_score = 0.4
+        elif day_move_pct < min_move_pct:
+            move_score = 0.6 + (day_move_pct / max(min_move_pct, 1e-9))
+        elif day_move_pct <= max_move_pct:
+            move_score = 2.0
+        else:
+            move_score = max(0.25, 2.0 - min((day_move_pct - max_move_pct) / max(max_move_pct, 1.0), 1.5))
+        major_bonus = 1.5 if sym in major_symbols else 0.0
+        return round(liquidity_score * 2.0 + funding_score + move_score + major_bonus, 6)
+
     for t in ex.tickers():
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
@@ -193,46 +212,16 @@ def screen_coins(ex, cfg):
         try:
             vol = float(t.get("turnover24h", 0))
             fr = abs(float(t.get("fundingRate", 0)))
+            day_move_pct = abs(float(t.get("price24hPcnt", 0) or 0.0)) * 100.0
             if vol >= cfg["min_volume_24h"] and fr < cfg["max_funding_abs"]:
-                result.append((sym, vol))
+                result.append((sym, universe_score(sym.upper(), vol, fr, day_move_pct), vol))
         except Exception:
             continue
-    result.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in result[: max(int(cfg.get("max_scan_symbols", 20) or 20), 1)]]
+    result.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return [s for s, _, _ in result[: max(int(cfg.get("max_scan_symbols", 20) or 20), 1)]]
 
 
 def signal_quality_filter(sig: dict, ind: dict, cfg: dict, oi_change_pct: float = 0.0) -> tuple[bool, str]:
-    strategy = str(sig.get("strategy") or "")
-    if strategy != "fakeout":
-        return True, ""
-
-    price = float(ind.get("price") or sig.get("entry") or 0.0)
-    support = float(ind.get("support") or price)
-    resistance = float(ind.get("resistance") or price)
-    atr = float(ind.get("atr") or 0.0)
-    vol_ratio = float(ind.get("vol_ratio") or 0.0)
-    if price <= 0:
-        return False, "invalid_price"
-
-    atr_ratio = atr / price if price > 0 else 0.0
-    range_size = max(resistance - support, 1e-9)
-    range_frac = (float(sig.get("entry") or price) - support) / range_size
-    direction = str(sig.get("direction") or "")
-    edge_max = float(cfg.get("fakeout_edge_max_frac", 0.12) or 0.12)
-    max_atr_ratio = float(cfg.get("fakeout_max_atr_ratio", 0.012) or 0.012)
-    max_oi_change_pct = float(cfg.get("fakeout_max_oi_change_pct", 2.0) or 2.0)
-    min_vol_ratio = float(cfg.get("fakeout_min_vol_ratio", 90.0) or 90.0)
-
-    if direction == "LONG" and range_frac > edge_max:
-        return False, "fakeout_far_from_support"
-    if direction == "SHORT" and range_frac < (1.0 - edge_max):
-        return False, "fakeout_far_from_resistance"
-    if atr_ratio > max_atr_ratio:
-        return False, "fakeout_too_volatile"
-    if abs(float(oi_change_pct or 0.0)) > max_oi_change_pct:
-        return False, "fakeout_oi_unstable"
-    if vol_ratio < min_vol_ratio:
-        return False, "fakeout_volume_weak"
     return True, ""
 
 
@@ -289,7 +278,7 @@ def _opp_side_biases(direction: str) -> set[str]:
     return {"bear_expansion", "bear_trend", "bear_soft"} if direction == "LONG" else {"bull_expansion", "bull_trend", "bull_soft"}
 
 
-def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> tuple[bool, str]:
+def regime_filter(ind1h, ind4h, direction: str, strategy: str = "trend_pullback") -> tuple[bool, str]:
     try:
         r1 = _regime_profile(ind1h)
         r4 = _regime_profile(ind4h)
@@ -298,15 +287,6 @@ def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> t
 
     same_side = _same_side_biases(direction)
     opp_side = _opp_side_biases(direction)
-    opposite_expansion = "bear_expansion" if direction == "LONG" else "bull_expansion"
-
-    if strategy == "reversal":
-        if r1["bias"] == opposite_expansion or r4["bias"] == opposite_expansion:
-            return False, "regime_reversal_vs_expansion"
-        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
-            return False, "regime_flat"
-        return True, ""
-
     if strategy == "range_bounce":
         if r1["bias"] in opp_side and r4["bias"] in opp_side:
             return False, "regime_countertrend"
@@ -320,41 +300,15 @@ def regime_filter(ind1h, ind4h, direction: str, strategy: str = "breakout") -> t
         )
         return ok, "" if ok else "regime_mismatch"
 
-    if strategy == "trend_pullback":
-        if r1["bias"] in opp_side or r4["bias"] in opp_side:
-            return False, "regime_countertrend"
-        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
-            return False, "regime_flat"
-        ok = (
-            r1["bias"] in (same_side | {"mixed"})
-            and r4["bias"] in (same_side | {"mixed"})
-        )
-        return ok, "" if ok else "regime_mismatch"
-
-    if strategy == "fakeout":
-        if r4["bias"] in opp_side and r4["bias"] != ("bear_soft" if direction == "LONG" else "bull_soft"):
-            return False, "regime_countertrend"
-        if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
-            return False, "regime_flat"
-        ok = (
-            r1["bias"] in (same_side | {"mixed", "flat"})
-            and r4["bias"] in (same_side | {"mixed", "flat"})
-        )
-        return ok, "" if ok else "regime_mismatch"
-
+    if strategy != "trend_pullback":
+        return False, "strategy_disabled"
     if r1["bias"] in opp_side or r4["bias"] in opp_side:
         return False, "regime_countertrend"
     if r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
         return False, "regime_flat"
-    if r1["bias"] == "chop":
-        return False, "regime_chop"
     ok = (
-        r1["bias"] in same_side
+        r1["bias"] in (same_side | {"mixed"})
         and r4["bias"] in (same_side | {"mixed"})
-        and (
-            r1["bias"] in {"bull_expansion", "bull_trend", "bear_expansion", "bear_trend"}
-            or r4["bias"] in {"bull_expansion", "bull_trend", "bear_expansion", "bear_trend"}
-        )
     )
     return ok, "" if ok else "regime_mismatch"
 
@@ -366,28 +320,17 @@ def btc_context_filter(symbol: str, sig: dict, btc1h: dict, btc4h: dict) -> tupl
     strategy = str(sig.get("strategy") or "")
     r1 = _regime_profile(btc1h)
     r4 = _regime_profile(btc4h)
-    same_side = _same_side_biases(direction)
     opp_side = _opp_side_biases(direction)
 
     if r1["bias"] in opp_side and r4["bias"] in opp_side:
         return False, "btc_countertrend"
-    if strategy == "breakout" and r1["bias"] in {"flat", "chop"} and r4["bias"] in {"flat", "chop"}:
-        return False, "btc_chop"
-    if strategy == "fakeout":
-        if r1["bias"] in opp_side and r1["bias"] not in {"bull_soft", "bear_soft"}:
-            return False, "btc_fakeout_countertrend"
-        if r4["bias"] in opp_side and r4["bias"] not in {"bull_soft", "bear_soft"}:
-            return False, "btc_fakeout_countertrend"
     if strategy == "range_bounce":
         if r1["bias"] in opp_side and r4["bias"] in opp_side:
             return False, "btc_range_countertrend"
         if r1["bias"] in {"bull_expansion", "bear_expansion"} and r4["bias"] in {"bull_expansion", "bear_expansion"}:
             return False, "btc_range_vs_expansion"
-    if strategy == "trend_pullback":
-        if r1["bias"] in opp_side and r4["bias"] in opp_side:
-            return False, "btc_countertrend"
-    if strategy == "reversal" and r4["bias"] in same_side and r1["bias"] in same_side:
-        return False, "btc_trend_not_exhausted"
+    if strategy not in {"trend_pullback", "range_bounce"}:
+        return False, "strategy_disabled"
     return True, ""
 
 
@@ -437,19 +380,19 @@ def no_middle_range(sig: dict, ind: dict, avoid_pct: float) -> tuple[bool, str]:
     rng = max(res - sup, 1e-9)
     frac = (p - sup) / rng
     direction = sig["direction"]
-    strategy = sig["strategy"]
     edge = float(avoid_pct)
-    if strategy == "breakout":
-        if direction == "LONG":
-            ok = frac >= (1.0 - edge)
-        else:
-            ok = frac <= edge
+    if direction == "LONG":
+        ok = frac <= edge
     else:
-        if direction == "LONG":
-            ok = frac <= edge
-        else:
-            ok = frac >= (1.0 - edge)
+        ok = frac >= (1.0 - edge)
     return ok, "" if ok else "middle_of_range"
+
+
+def effective_middle_avoid_pct(sig: dict, cfg: dict) -> float:
+    strategy = str(sig.get("strategy") or "")
+    if strategy == "trend_pullback":
+        return float(cfg.get("trend_pullback_mid_avoid_pct", cfg.get("range_mid_avoid_pct", 0.30)) or 0.30)
+    return float(cfg.get("range_mid_avoid_pct", 0.30) or 0.30)
 
 
 def score_signal(sig: dict, ind: dict, funding: float, oi_change_pct: float, regime_ok: bool) -> tuple[int, list[str]]:
@@ -523,49 +466,7 @@ def score_signal(sig: dict, ind: dict, funding: float, oi_change_pct: float, reg
         score -= 12
         reasons.append("rr_weak")
 
-    if sig["strategy"] == "breakout":
-        score += 3
-        if sig["direction"] == "LONG":
-            if range_frac >= 0.98:
-                score += 5
-                reasons.append("clean_breakout_edge")
-            elif range_frac < 0.9:
-                score -= 8
-                reasons.append("breakout_not_extended")
-        else:
-            if range_frac <= 0.02:
-                score += 5
-                reasons.append("clean_breakout_edge")
-            elif range_frac > 0.1:
-                score -= 8
-                reasons.append("breakout_not_extended")
-    elif sig["strategy"] == "fakeout":
-        if sig["direction"] == "LONG":
-            if range_frac <= 0.15:
-                score += 6
-                reasons.append("fakeout_near_support")
-            elif range_frac > 0.35:
-                score -= 6
-                reasons.append("fakeout_far_from_edge")
-        else:
-            if range_frac >= 0.85:
-                score += 6
-                reasons.append("fakeout_near_resistance")
-            elif range_frac < 0.65:
-                score -= 6
-                reasons.append("fakeout_far_from_edge")
-    elif sig["strategy"] == "reversal":
-        score -= 1
-        if atr_ratio > 0.015:
-            score -= 4
-            reasons.append("reversal_too_volatile")
-        if sig["direction"] == "LONG" and price > (float(ind.get("ema200") or price) * 1.01):
-            score -= 5
-            reasons.append("reversal_far_from_mean")
-        if sig["direction"] == "SHORT" and price < (float(ind.get("ema200") or price) * 0.99):
-            score -= 5
-            reasons.append("reversal_far_from_mean")
-    elif sig["strategy"] == "trend_pullback":
+    if sig["strategy"] == "trend_pullback":
         score += 5
         ema20 = float(ind.get("ema20") or price)
         ema50 = float(ind.get("ema50") or price)

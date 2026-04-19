@@ -72,9 +72,23 @@ def env_csv(name: str, default: list[str] | None = None) -> list[str]:
     return [x for x in items if x] or list(default or [])
 
 
+def env_csv_lower(name: str, default: list[str] | None = None) -> list[str]:
+    raw = os.getenv(name, "")
+    if raw is None:
+        return list(default or [])
+    items = [x.strip().lower() for x in str(raw).split(",")]
+    return [x for x in items if x] or list(default or [])
+
+
 def build_config() -> dict[str, Any]:
     load_dotenv_file(os.path.join(BASE_DIR, ".env"))
+    agent_profile = env_str("AGENT_PROFILE", "default").lower()
+    enabled_strategies = env_csv_lower("ENABLED_STRATEGIES", [])
+    if agent_profile == "v2-lite" and not enabled_strategies:
+        enabled_strategies = ["trend_pullback", "range_bounce"]
     return {
+        "agent_profile": agent_profile,
+        "enabled_strategies": enabled_strategies,
         "testnet": env_bool("TESTNET", True),
         "api_key": os.getenv("BYBIT_API_KEY", ""),
         "api_secret": os.getenv("BYBIT_API_SECRET", ""),
@@ -121,9 +135,11 @@ def build_config() -> dict[str, Any]:
         "max_scan_symbols": env_int("MAX_SCAN_SYMBOLS", 20),
         "symbol_blacklist": env_csv("SYMBOL_BLACKLIST", []),
         "max_funding_abs": env_float("MAX_FUNDING_ABS", 0.001),
-        "min_atr_ratio": env_float("MIN_ATR_RATIO", 0.005),
+        "min_atr_ratio": env_float("MIN_ATR_RATIO", 0.004),
         "min_atr_ratio_majors": env_float("MIN_ATR_RATIO_MAJORS", 0.002),
         "major_symbols": env_csv("MAJOR_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "LINKUSDT", "DOGEUSDT"]),
+        "universe_min_daily_move_pct": env_float("UNIVERSE_MIN_DAILY_MOVE_PCT", 0.8),
+        "universe_max_daily_move_pct": env_float("UNIVERSE_MAX_DAILY_MOVE_PCT", 18.0),
         "fakeout_edge_max_frac": env_float("FAKEOUT_EDGE_MAX_FRAC", 0.18),
         "fakeout_max_atr_ratio": env_float("FAKEOUT_MAX_ATR_RATIO", 0.014),
         "fakeout_max_oi_change_pct": env_float("FAKEOUT_MAX_OI_CHANGE_PCT", 2.0),
@@ -136,6 +152,7 @@ def build_config() -> dict[str, Any]:
         "funding_block_minutes": env_int("FUNDING_BLOCK_MINUTES", 10),
         "oi_spike_block_pct": env_float("OI_SPIKE_BLOCK_PCT", 8.0),
         "range_mid_avoid_pct": env_float("RANGE_MID_AVOID_PCT", 0.30),
+        "trend_pullback_mid_avoid_pct": env_float("TREND_PULLBACK_MID_AVOID_PCT", 0.45),
         "symbol_cooldown_min": env_int("SYMBOL_COOLDOWN_MIN", 120),
         "be_trigger_r": env_float("BE_TRIGGER_R", 1.0),
         "trailing_trigger_r": env_float("TRAILING_TRIGGER_R", 1.5),
@@ -160,6 +177,8 @@ def build_config() -> dict[str, Any]:
         "tg_timeout_sec": env_int("TG_TIMEOUT_SEC", 20),
         "state_db_path": os.getenv("STATE_DB_PATH", os.path.join(BASE_DIR, "agent_state.sqlite3")),
         "reports_dir": os.getenv("REPORTS_DIR", os.path.join(BASE_DIR, "reports")),
+        "enable_weekly_report": env_bool("ENABLE_WEEKLY_REPORT", True),
+        "weekly_report_days": env_int("WEEKLY_REPORT_DAYS", 7),
         "watchdog_heartbeat_grace_sec": env_int("WATCHDOG_HEARTBEAT_GRACE_SEC", 0),
         "watchdog_restart_cooldown_sec": env_int("WATCHDOG_RESTART_COOLDOWN_SEC", 1800),
         "watchdog_launchd_label": env_str("WATCHDOG_LAUNCHD_LABEL", "com.trading.agent"),

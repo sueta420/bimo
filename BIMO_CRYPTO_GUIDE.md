@@ -22,12 +22,23 @@
 - `/Users/bot/trading/.env`
 
 ### Текущий боевой профиль
+- `AGENT_PROFILE=v2-lite`
+- `ENABLED_STRATEGIES=trend_pullback,range_bounce`
 - `POSITION_SIZING_MODE=fixed_margin_usd`
 - `TARGET_MARGIN_USD=10`
+- `TARGET_RISK_USD=0`
+- `MIN_RISK_UTILIZATION=0`
 - `TARGET_LEVERAGE=5`
 - `MAX_LEVERAGE=20`
-- `MAX_RISK_PER_TRADE_USD=1.5`
-- `MIN_RR_RATIO=3.0`
+- `MAX_RISK_PER_TRADE_USD=2.0`
+- `MIN_RR_RATIO=2.7`
+- `MAX_SIDE_RISK_PCT=5.0`
+- `MAX_SIDE_RISK_USD=3.0`
+- `MAX_SCAN_SYMBOLS=35`
+- `MIN_VOLUME_24H=25000000`
+- `UNIVERSE_MIN_DAILY_MOVE_PCT=0.8`
+- `UNIVERSE_MAX_DAILY_MOVE_PCT=18.0`
+- `CYCLE_SEC=600`
 
 ### LaunchAgent
 - `/Users/bot/Library/LaunchAgents/com.trading.agent.plist`
@@ -40,7 +51,8 @@
 - Читать последние строки логов
 - Объяснять `skip`-причины
 - Сводить результаты дня
-- Сводить стратегию по `fakeout / breakout / reversal`
+- Сводить rolling weekly summary из `REPORTS_DIR`
+- Сводить стратегию по текущему `v2-lite` режиму: `trend_pullback / range_bounce`
 - Смотреть post-trade метрики: `realized_r`, `hold_minutes`, `mfe_r`, `mae_r`
 - Понимать разницу между `notional`, `margin`, `leverage` и `risk cap`
 - Предлагать изменения конфигурации
@@ -73,7 +85,7 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 
 ### Нормальные рабочие строки
 - `agent_start` — агент поднялся
-- `sleep_sec=900` — цикл завершен, агент спит до следующего прохода
+- `sleep_sec=600` — цикл завершен, агент спит до следующего прохода
 - `skip ...` — символ проверен, но сигнал не прошел фильтры
 - `candidate ...` — найден сильный кандидат
 - `opened ...` — сделка реально открыта
@@ -94,6 +106,7 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 - “сделай короткий отчет за день”
 - “сравни текущий runtime env с рекомендованным профилем”
 - “объясни текущий режим sizing и какой сейчас реальный риск на сделку”
+- “проверь, что агент действительно работает в `v2-lite` и торгует только `trend_pullback/range_bounce`”
 
 Плохие запросы:
 - “сам прими сделку вместо агента”
@@ -104,10 +117,13 @@ tail -f /Users/bot/.openclaw/workspace-crypto/bimo/agent_2026-04-16.log
 - `TESTNET=false`
 - ключи Bybit соответствуют боевому режиму
 - `POSITION_SIZING_MODE` выставлен как нужно
+- `AGENT_PROFILE=v2-lite`, если нужен упрощенный боевой режим
+- `ENABLED_STRATEGIES=trend_pullback,range_bounce`
 - если используется `fixed_notional_usd`, то `TARGET_NOTIONAL_USD` выставлен как нужно
 - если используется `fixed_margin_usd`, то `TARGET_MARGIN_USD` и `TARGET_LEVERAGE` выставлены как нужно
 - `MAX_LEVERAGE` не слишком агрессивен
 - `MAX_RISK_PER_TRADE_USD` не слишком агрессивен
+- `TARGET_RISK_USD=0` и `MIN_RISK_UTILIZATION=0`, если риск должен быть свободным снизу и ограниченным только сверху
 - `ENABLE_EOD_CLOSE=false`, если позиции должны жить до `SL/TP`
 - `SESSION_TIMEZONE=Europe/Moscow`, если нужен московский торговый день
 
@@ -143,4 +159,5 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trading.agent.plist
 
 Пример текущего профиля:
 - `10 USDT margin @ 5x` = примерно `50 USDT notional`
-- при `MAX_RISK_PER_TRADE_USD=1.5` агент пропускает сделки, где структура требует большего убытка
+- при `MAX_RISK_PER_TRADE_USD=2.0` агент пропускает сделки, где структура требует большего убытка
+- нижняя граница риска сейчас не зафиксирована, то есть агент может брать и более “легкие” по риску сделки, если они проходят остальные фильтры

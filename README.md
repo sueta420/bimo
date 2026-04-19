@@ -24,7 +24,8 @@
 ## Что реализовано
 
 ### Сигналы и фильтры
-- Rule-based сигналы: `breakout`, `fakeout`, `reversal`
+- Rule-based сигналы в текущем боевом профиле: `trend_pullback`, `range_bounce`
+- В `signals.py` боевой контур уже физически дочищен под `v2-lite`: новые сигналы генерируются только для `trend_pullback` и `range_bounce`
 - Regime-фильтрация по `1h` и `4h`
 - BTC context filter для альтов
 - Входы на `15m`
@@ -33,7 +34,6 @@
 - Фильтр funding window
 - Блокировка по резкому всплеску `OI`
 - Фильтр “edge after costs”
-- Quality filter для `fakeout`
 - Поддержка `SYMBOL_BLACKLIST`
 - Score-модель с причинами `reasons`
 - Логирование `candidate`, `skip`, `candidate_pool`
@@ -42,6 +42,7 @@
 - Режимы sizing:
   - `risk_pct`
   - `risk_usd`
+  - `fixed_margin_usd`
   - `fixed_notional_usd`
 - Учет:
   - taker fee
@@ -53,6 +54,7 @@
   - `min_qty`
   - `min_notional`
   - `max_side_risk_pct`
+  - `max_side_risk_usd`
   - correlation guard
   - `max_risk_per_trade_usd`
 
@@ -122,8 +124,8 @@
 ## Как агент работает сейчас
 
 ### Частота цикла
-- По умолчанию `CYCLE_SEC=900`
-- То есть один цикл примерно раз в `15 минут`
+- Текущий боевой режим: `CYCLE_SEC=600`
+- То есть один цикл примерно раз в `10 минут`
 
 ### Сколько инструментов сканируется
 - Сейчас агент берет только `USDT`-контракты
@@ -131,27 +133,62 @@
   - `MIN_VOLUME_24H`
   - `MAX_FUNDING_ABS`
 - Исключает тикеры из `SYMBOL_BLACKLIST`
-- Потом сортирует по `turnover24h`
+- Потом ранжирует universe не только по ликвидности, но и по пригодности:
+  - `turnover24h`
+  - умеренный `24h move`
+  - нормальность funding
+  - bonus для `MAJOR_SYMBOLS`
 - И берет top `MAX_SCAN_SYMBOLS`
 - При rate-limit временно сам сужает universe
+- В текущем боевом профиле:
+  - `MAX_SCAN_SYMBOLS=35`
+  - `MIN_VOLUME_24H=25000000`
+  - `UNIVERSE_MIN_DAILY_MOVE_PCT=0.8`
+  - `UNIVERSE_MAX_DAILY_MOVE_PCT=18.0`
+  - фактический universe обычно заметно меньше лимита и зависит от текущего рынка
 
 ### Размер позиции в текущем боевом профиле
 Сейчас боевой профиль настроен так:
+- `AGENT_PROFILE=v2-lite`
+- `ENABLED_STRATEGIES=trend_pullback,range_bounce`
 - `POSITION_SIZING_MODE=fixed_margin_usd`
 - `TARGET_MARGIN_USD=10`
 - `TARGET_LEVERAGE=5`
 - `MAX_LEVERAGE=20`
-- `MAX_RISK_PER_TRADE_USD=1.5`
-- `MIN_RR_RATIO=3.0`
-- `MAX_TRADES_PER_DAY=5`
+- `TARGET_RISK_USD=0`
+- `MIN_RISK_UTILIZATION=0`
+- `MAX_RISK_PER_TRADE_USD=2.0`
+- `MIN_RR_RATIO=2.7`
+- `MAX_SIDE_RISK_PCT=5.0`
+- `MAX_SIDE_RISK_USD=3.0`
+- `MAX_TRADES_PER_DAY=0`
 - `STOP_AFTER_LOSSES=2`
 
 Это означает:
 - агент целится использовать около `10 USDT` маржи на сделку;
 - при `5x` это дает примерно `50 USDT notional`;
-- сделки с заведомо плохим риском не проходят;
+- нижняя граница риска сейчас не зафиксирована, но верхний риск жестко ограничен `2 USDT`;
 - сделки с плохим `R:R` не проходят;
 - после серии убытков агент сам останавливает торговлю на день.
+
+### Что такое `v2-lite`
+Это упрощенный боевой режим, в котором агент торгует только две стратегии:
+- `trend_pullback`
+- `range_bounce`
+
+Задача `v2-lite`:
+- уменьшить внутренние конфликты между стратегиями;
+- упростить диагностику качества входов;
+- повысить шанс получать реальные сделки, а не только `skip`;
+- быстрее понять, какие именно сетапы дают edge.
+
+В `v2-lite` старые стратегии не должны использоваться для принятия новых боевых решений.
+
+### Weekly report
+- Помимо дневного отчета агент теперь собирает rolling weekly summary из SQLite-истории
+- Источник: закрытые сделки за последние `WEEKLY_REPORT_DAYS`
+- Файл сохраняется в `REPORTS_DIR` как `weekly_report_last_<N>d_<date>.txt`
+- В Telegram отправляется короткая weekly summary по стратегиям, винрейту и `PnL`
 
 ## Все режимы sizing
 
@@ -306,16 +343,17 @@
 Если структура сделки требует большего риска, сигнал будет пропущен.
 
 ### Что сейчас стоит в бою
-- `MAX_RISK_PER_TRADE_USD=1.5`
+- `MAX_RISK_PER_TRADE_USD=2.0`
 
 Это примерно:
-- около `2.6%` от депозита `58 USDT`
-- при `R:R = 1:3` целевой reward около `4.5 USDT`
+- около `3.4%` от депозита `58 USDT` в верхней границе
+- при `R:R = 1:3` верхний целевой reward около `6.0 USDT`
 
 ### Что обычно разумно
 - `1.0 USDT` — спокойный старт
 - `1.2-1.5 USDT` — бодро, но терпимо
-- `2.0 USDT+` — уже агрессивно для малого депозита
+- `2.0 USDT` — агрессивнее, но еще допустимо для малого депозита, если фильтры уже ужаты до `v2-lite`
+- `2.5 USDT+` — уже очень агрессивно для малого депозита
 
 ## Полная инструкция по настройке
 
@@ -371,35 +409,36 @@ cp .env.example .env
 ### 6. Рекомендуемый боевой профиль для малого депозита
 ```env
 TESTNET=false
+AGENT_PROFILE=v2-lite
+ENABLED_STRATEGIES=trend_pullback,range_bounce
 POSITION_SIZING_MODE=fixed_margin_usd
 TARGET_MARGIN_USD=10
+TARGET_RISK_USD=0
+MIN_RISK_UTILIZATION=0
 TARGET_LEVERAGE=5
 MAX_LEVERAGE=20
 DYNAMIC_LEVERAGE_ENABLED=true
-FAKEOUT_TARGET_LEVERAGE=4
-BREAKOUT_TARGET_LEVERAGE=5
-REVERSAL_TARGET_LEVERAGE=3
 DYNAMIC_LEVERAGE_HIGH_SCORE=80
 DYNAMIC_LEVERAGE_LOW_SCORE=72
 DYNAMIC_LEVERAGE_HIGH_SCORE_BONUS=1
 DYNAMIC_LEVERAGE_LOW_SCORE_CUT=1
 DYNAMIC_LEVERAGE_HIGH_ATR_RATIO=0.012
 DYNAMIC_LEVERAGE_HIGH_ATR_CUT=1
-MAX_RISK_PER_TRADE_USD=1.5
-MIN_RR_RATIO=3.0
+MAX_RISK_PER_TRADE_USD=2.0
+MIN_RR_RATIO=2.7
 MIN_EDGE_COST_RATIO=2.0
 MIN_NET_REWARD_PCT=0.25
 MIN_RULE_SCORE=70
-MAX_SCAN_SYMBOLS=20
+MAX_SIDE_RISK_PCT=5.0
+MAX_SIDE_RISK_USD=3.0
+MAX_SCAN_SYMBOLS=35
+MIN_VOLUME_24H=25000000
 SYMBOL_BLACKLIST=FARTCOINUSDT,1000PEPEUSDT,RAVEUSDT
-FAKEOUT_EDGE_MAX_FRAC=0.12
-FAKEOUT_MAX_ATR_RATIO=0.012
-FAKEOUT_MAX_OI_CHANGE_PCT=2.0
-FAKEOUT_MIN_VOL_RATIO=90
-MAX_TRADES_PER_DAY=5
+MAX_TRADES_PER_DAY=0
 STOP_AFTER_LOSSES=2
 SESSION_TIMEZONE=Europe/Moscow
 ENABLE_EOD_CLOSE=false
+CYCLE_SEC=600
 ```
 
 ### 7. Более спокойный профиль
@@ -417,9 +456,7 @@ MIN_RR_RATIO=3.0
 - не торговать шумные low-cap без blacklist или whitelist.
 
 ### Как сейчас выбирается плечо в бою
-- `fakeout` базово: `4x`
-- `breakout` базово: `5x`
-- `reversal` базово: `3x`
+- базовое плечо: `5x`
 - сильный `score` может дать небольшой бонус
 - высокий `ATR` может уменьшить плечо
 - итог все равно ограничен `MAX_LEVERAGE` и `MAX_RISK_PER_TRADE_USD`

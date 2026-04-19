@@ -266,6 +266,25 @@ class StateStore:
                 continue
         return out
 
+    def load_closed_trades_since(self, since_iso: str) -> list[Trade]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT payload_json
+            FROM trades
+            WHERE close_time IS NOT NULL AND close_time >= ?
+            ORDER BY close_time DESC
+            """,
+            (since_iso,),
+        )
+        out = []
+        for row in cur.fetchall():
+            try:
+                out.append(Trade(**json.loads(row["payload_json"])))
+            except Exception:
+                continue
+        return out
+
     def set_cooldown(self, symbol: str, minutes: int):
         until = (datetime.now(timezone.utc) + timedelta(minutes=max(minutes, 0))).isoformat()
         cur = self.conn.cursor()

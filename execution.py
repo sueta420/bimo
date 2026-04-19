@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from exchange import BybitClient, normalize_order_qty
@@ -33,6 +33,7 @@ from signals import (
     calc_indicators,
     detect_signals,
     edge_after_costs,
+    effective_middle_avoid_pct,
     in_funding_block,
     no_middle_range,
     oi_spike_block,
@@ -49,6 +50,7 @@ def make_report(
     session_timezone: str = "UTC",
     reports_dir: str | None = None,
 ) -> tuple[str, str]:
+    max_trades_label = "∞" if int(max_trades_per_day or 0) <= 0 else str(int(max_trades_per_day))
     wins = [t for t in stats.trades if (t.pnl_usd or 0) > 0]
     losses = [t for t in stats.trades if (t.pnl_usd or 0) < 0]
     pnl = sum((t.pnl_usd or 0) for t in stats.trades)
@@ -68,7 +70,7 @@ def make_report(
         )
     report = (
         f"\n{'=' * 52}\n  ОТЧЁТ {stats.date} ({session_timezone})\n{'=' * 52}\n"
-        f"  Сделок:{closed}/{max_trades_per_day} WIN:{len(wins)} LOSS:{len(losses)}\n"
+        f"  Сделок:{closed}/{max_trades_label} WIN:{len(wins)} LOSS:{len(losses)}\n"
         f"  Винрейт:{wr:.1f}% | PnL:{pnl:+.4f}$\n"
         f"  Сигналов:{stats.signals_total} | Скип:{stats.skipped} | Открыто:{stats.opened} | Закрыто:{closed}\n"
     )
@@ -82,6 +84,47 @@ def make_report(
     base_dir = os.path.abspath(reports_dir or os.getcwd())
     os.makedirs(base_dir, exist_ok=True)
     path = os.path.join(base_dir, f"report_{stats.date.replace('-', '')}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report)
+    return report, path
+
+
+def make_period_report(
+    title: str,
+    period_label: str,
+    trades: list[Trade],
+    session_timezone: str = "UTC",
+    reports_dir: str | None = None,
+    file_prefix: str = "period_report",
+) -> tuple[str, str]:
+    wins = [t for t in trades if (t.pnl_usd or 0) > 0]
+    losses = [t for t in trades if (t.pnl_usd or 0) < 0]
+    pnl = sum((t.pnl_usd or 0) for t in trades)
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    strategy_rows = _strategy_rows(trades)
+    lines = []
+    for i, t in enumerate(trades, 1):
+        icon = "WIN" if (t.pnl_usd or 0) > 0 else ("LOSS" if (t.pnl_usd or 0) < 0 else "BE")
+        lines.append(
+            f"  #{i}[{icon}] {t.symbol} {t.direction} {t.strategy} "
+            f"PnL:{(t.pnl_usd or 0):+.4f}$ R:{(t.realized_r if t.realized_r is not None else 0):+.2f} "
+            f"Hold:{(t.hold_minutes if t.hold_minutes is not None else 0):.0f}m "
+            f"score:{t.score} {t.close_reason or '-'}"
+        )
+    report = (
+        f"\n{'=' * 52}\n  {title} {period_label} ({session_timezone})\n{'=' * 52}\n"
+        f"  Сделок:{len(trades)} WIN:{len(wins)} LOSS:{len(losses)}\n"
+        f"  Винрейт:{wr:.1f}% | PnL:{pnl:+.4f}$\n"
+    )
+    if strategy_rows:
+        report += f"{'─' * 52}\n{strategy_rows}\n"
+    report += f"{'─' * 52}\n"
+    report += "\n".join(lines) if lines else "  Сделок не было"
+    report += f"\n{'=' * 52}\n"
+    base_dir = os.path.abspath(reports_dir or os.getcwd())
+    os.makedirs(base_dir, exist_ok=True)
+    safe_label = period_label.replace(" ", "_").replace(":", "").replace("/", "-")
+    path = os.path.join(base_dir, f"{file_prefix}_{safe_label}.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(report)
     return report, path
@@ -270,6 +313,10 @@ class Agent:
             base = int(self.cfg.get("target_leverage", 1) or 1)
             return f"adaptive actual={actual}x base={base}x target={target}x"
         return f"fixed {actual}x"
+
+    def _max_trades_limit(self) -> int | None:
+        limit = int(self.cfg.get("max_trades_per_day", 0) or 0)
+        return None if limit <= 0 else limit
 
     def _close_message_text(self, t: Trade, title: str, reason_label: str | None = None) -> str:
         lines = [
@@ -621,6 +668,20 @@ class Agent:
             + (f"Skip summary:\n{skip_rows}" if skip_rows else "")
         )
 
+    def weekly_summary_text(self, trades: list[Trade], days: int) -> str:
+        wins = [t for t in trades if (t.pnl_usd or 0) > 0]
+        losses = [t for t in trades if (t.pnl_usd or 0) < 0]
+        pnl = sum((t.pnl_usd or 0) for t in trades)
+        wr = len(wins) / len(trades) * 100 if trades else 0
+        strategy_rows = _strategy_rows(trades)
+        return (
+            f"Rolling weekly summary ({days}d)\n"
+            f"Сделок: {len(trades)}\n"
+            f"WIN: {len(wins)} LOSS: {len(losses)} WR: {wr:.1f}%\n"
+            f"Итог PnL: {pnl:+.4f}$\n"
+            + (f"Стратегии:\n{strategy_rows}" if strategy_rows else "Сделок не было")
+        )
+
     def _set_stop_cooldown(self, symbol: str):
         self.store.set_cooldown(symbol, self.cfg["symbol_cooldown_min"])
 
@@ -641,6 +702,21 @@ class Agent:
             self.log.info(f"report_path={path}")
             print(report)
             self.tg.send(self.day_summary_text("Суточный отчёт агента", open_before_close), force=True)
+            if self.cfg.get("enable_weekly_report", True):
+                weekly_days = max(int(self.cfg.get("weekly_report_days", 7) or 7), 2)
+                since_dt = datetime.now(timezone.utc) - timedelta(days=weekly_days)
+                weekly_trades = self.store.load_closed_trades_since(since_dt.isoformat())
+                weekly_report, weekly_path = make_period_report(
+                    "WEEKLY REPORT",
+                    f"last_{weekly_days}d_{today}",
+                    weekly_trades,
+                    self.cfg.get("session_timezone", "UTC"),
+                    self.cfg.get("reports_dir"),
+                    "weekly_report",
+                )
+                self.log.info(f"weekly_report_path={weekly_path}")
+                print(weekly_report)
+                self.tg.send(self.weekly_summary_text(weekly_trades, weekly_days), force=True)
             self.stats = DayStats(date=today)
             self._save_day_stats()
 
@@ -1008,9 +1084,10 @@ class Agent:
             return
 
         done = len(self.stats.trades) + len(self.open_trades)
-        if done >= self.cfg["max_trades_per_day"]:
-            self.log.info(f"cycle_id={self._cycle_seq} why_not_trading=max_trades_per_day done={done} limit={self.cfg['max_trades_per_day']}")
-            self.log.info(f"cycle_blocked=max_trades_per_day done={done} limit={self.cfg['max_trades_per_day']}")
+        max_trades_limit = self._max_trades_limit()
+        if max_trades_limit is not None and done >= max_trades_limit:
+            self.log.info(f"cycle_id={self._cycle_seq} why_not_trading=max_trades_per_day done={done} limit={max_trades_limit}")
+            self.log.info(f"cycle_blocked=max_trades_per_day done={done} limit={max_trades_limit}")
             return
 
         symbols = screen_coins(self.ex, self.cfg)[: self._effective_scan_limit()]
@@ -1093,7 +1170,7 @@ class Agent:
                         )
                         cycle_summary["skips"] += 1
                         continue
-                    ok_mid, mid_reason = no_middle_range(s, ind, self.cfg["range_mid_avoid_pct"])
+                    ok_mid, mid_reason = no_middle_range(s, ind, effective_middle_avoid_pct(s, self.cfg))
                     if not ok_mid:
                         self.stats.skipped += 1
                         self._save_day_stats()
@@ -1220,10 +1297,11 @@ class Agent:
         candidates.sort(key=lambda x: x["score"], reverse=True)
         self._log_candidate_pool(candidates)
         candidates = self._candidate_llm_rank(candidates)
-        slots = self.cfg["max_trades_per_day"] - done
+        slots = (max_trades_limit - done) if max_trades_limit is not None else len(candidates)
 
         for item in candidates[: slots + 3]:
-            if len(self.open_trades) + len(self.stats.trades) >= self.cfg["max_trades_per_day"]:
+            current_total = len(self.open_trades) + len(self.stats.trades)
+            if max_trades_limit is not None and current_total >= max_trades_limit:
                 break
 
             sym = item["sym"]
@@ -1411,10 +1489,17 @@ class Agent:
 
     async def run(self):
         mode = "TESTNET" if self.cfg["testnet"] else "*** REAL MONEY ***"
-        self.log.info(f"agent_start mode={mode} model={self.cfg['llm_model']} sizing={self._sizing_label()}")
+        enabled_strategies = self.cfg.get("enabled_strategies") or ["all"]
+        profile = str(self.cfg.get("agent_profile") or "default")
+        strategy_label = ",".join(enabled_strategies)
+        max_trades_label = self._max_trades_limit()
+        self.log.info(
+            f"agent_start mode={mode} profile={profile} strategies={strategy_label} "
+            f"model={self.cfg['llm_model']} sizing={self._sizing_label()}"
+        )
         self.tg.send(
-            f"Агент запущен\nРежим: {mode}\nМодель: {self.cfg['llm_model']}\n"
-            f"Sizing: {self._sizing_label()} | Max/day: {self.cfg['max_trades_per_day']}",
+            f"Агент запущен\nРежим: {mode}\nПрофиль: {profile}\nСтратегии: {strategy_label}\nМодель: {self.cfg['llm_model']}\n"
+            f"Sizing: {self._sizing_label()} | Max/day: {max_trades_label if max_trades_label is not None else '∞'}",
             force=True,
         )
         self._save_heartbeat()
